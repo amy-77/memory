@@ -1,0 +1,312 @@
+"""Recall on the synthetic dialogues with selective writing and scored replay (no training).
+
+Same protocol as eval_synth.py: the dialogue is one sequence, every turn is one write, attention
+sees the last --window tokens, and the question + answer form a final read-only segment. New here:
+the question is known while the history is written (it sits in the same forward), so its read
+vectors can score every history token (see lact_qwen/select.py). The answer tokens are masked out
+of the scoring, so nothing about the answer leaks into the write.
+
+    python scripts/eval_select.py --data D.jsonl --memory CKPT --model Qwen/Qwen3-0.6B --window 2048 --sinks 4 \
+        --select query --tau 0.5 --cap 10 [--seg-gain] [--replay scored_kv --replay-keep 16 --replay-samples 256]
+
+`--select oracle` puts the weight on the sentence that states the queried fact (upper bound for
+any scoring rule). The printed "enrichment" is the mean weight on that sentence divided by the
+mean weight of the turn it is in: 1.0 means the rule does not find the fact.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lact_qwen.dialog import build_query_batch, score_rows
+from lact_qwen.dialog import EncodedDialogue
+from lact_qwen.loading import add_model_args, autocast, load_model, load_tokenizer
+from lact_qwen.modeling import set_replay
+from lact_qwen.select import SELECT_MODES, SelectConfig, lexical_weights, rarity
+from lact_qwen.synth import read_jsonl, turn_text
+
+
+def encode_with_offsets(dialogue, tokenizer):
+    """Token ids, turn spans, and for every turn the character offsets of its tokens."""
+    ids, spans, offsets, texts = [], [], [], []
+    for i, body in enumerate(dialogue["turns"]):
+        text = turn_text(i, body)
+        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        spans.append((len(ids), len(ids) + len(enc.input_ids)))
+        ids.extend(enc.input_ids)
+        offsets.append(enc.offset_mapping)
+        texts.append(text)
+    return EncodedDialogue(ids, spans), offsets, texts
+
+
+def fact_sentence_tokens(q, enc, offsets, texts):
+    """Token range [a, b) of the sentence in the fact's turn that contains the answer value."""
+    t = q["fact_turn"]
+    text = texts[t]
+    pos = text.find(q["answer"])
+    if pos < 0:
+        return None
+    start = max(text.rfind(". ", 0, pos), text.rfind("\n", 0, pos)) + 1
+    end = text.find(".", pos)
+    end = len(text) if end < 0 else end + 1
+    toks = [j for j, (a, b) in enumerate(offsets[t]) if a < end and b > start]
+    if not toks:
+        return None
+    base = enc.turn_spans[t][0]
+    vend = pos + len(q["answer"])
+    vt = [j for j, (a, b) in enumerate(offsets[t]) if a < vend and b > pos]
+    return base + toks[0], base + toks[-1] + 1, base + vt[0], base + vt[-1] + 1
+
+
+def distance_bucket(dist, window):
+    if window <= 0:
+        return "full_attention"
+    return "inside_window" if dist < window else "beyond_window"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data", required=True)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--max-segment", type=int, default=4096)
+    p.add_argument("--min-write-tokens", type=int, default=0)
+    p.add_argument("--out", default=None)
+    p.add_argument("--select", default="none", choices=SELECT_MODES + ("lexical",),
+                   help="'lexical': boost history tokens that equal a rare token of the question (and the tokens after them); "
+                   "computed once from token ids, the same weights are used in every layer")
+    p.add_argument("--boost", type=float, default=10.0, help="--select lexical: weight on a full hit")
+    p.add_argument("--min-rarity", type=float, default=0.5, help="--select lexical: ignore question tokens less rare than this")
+    p.add_argument("--idf", default="history", help="--select lexical: where token rarity comes from: 'history' (this dialogue, "
+                   "not available when streaming) or a jsonl of dialogues used as a fixed background corpus")
+    p.add_argument("--tau", type=float, default=0.5)
+    p.add_argument("--cap", type=float, default=10.0)
+    p.add_argument("--floor", type=float, default=0.0)
+    p.add_argument("--topk-frac", type=float, default=0.1)
+    p.add_argument("--pool", type=int, default=1)
+    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--agnostic-reduce", default="max", choices=["max", "sum"])
+    p.add_argument("--agnostic-tau", type=float, default=0.05)
+    p.add_argument("--seg-gain", action="store_true")
+    p.add_argument("--seg-tau", type=float, default=0.5)
+    p.add_argument("--seg-cap", type=float, default=4.0)
+    p.add_argument("--score-layer", type=int, default=-1)
+    p.add_argument("--query-last", type=int, default=0, help="score with only the last N question tokens (0 = all)")
+    p.add_argument("--pool-mode", default="center", choices=["center", "forward"])
+    p.add_argument("--keep", type=float, default=0.0, help="SnapKV-style hard selection: share of each turn's tokens written")
+    p.add_argument("--probe-src", default=None, choices=["query", "bank", "both"], help="--replay pseudo: rehearsal probes")
+    p.add_argument("--pseudo-target", default=None, choices=["delta", "full"], help="--replay pseudo: what is rehearsed")
+    p.add_argument(
+        "--query-source", default="tail", choices=["tail", "alone", "prefix"],
+        help="where the question's read vectors come from: 'tail' = the question at the end of the same forward "
+        "(reference: it has seen the end of the history); 'alone' = a forward of the question by itself before "
+        "the history, reused for every turn; 'prefix' = the question is put in front of every turn",
+    )
+    p.add_argument("--oracle-high", type=float, default=10.0, help="--select oracle: weight on the fact sentence")
+    p.add_argument("--oracle-low", type=float, default=0.1, help="--select oracle: weight elsewhere in that turn")
+    p.add_argument("--replay-keep", type=int, default=None, help="scored_kv: pairs kept per written segment")
+    p.add_argument("--replay-bank", type=int, default=None, help="scored_kv: bank size")
+    p.add_argument("--replay-lr-scale", type=float, default=None, help="scored_kv: rate multiplier of replayed pairs")
+    add_model_args(p)
+    args = p.parse_args()
+
+    tok = load_tokenizer(args)
+    model, mem_cfg = load_model(args, tok)
+    ctx = getattr(model, "lact_ctx", None)
+    extra = {
+        "keep_per_segment": args.replay_keep,
+        "bank_size": args.replay_bank,
+        "kv_lr_scale": args.replay_lr_scale,
+        "probe_src": args.probe_src,
+        "pseudo_target": args.pseudo_target,
+    }
+    extra = {k: v for k, v in extra.items() if v is not None}
+    if extra and ctx is not None:
+        set_replay(model, **extra)
+    lexical = args.select == "lexical"
+    corpus_counts = None
+    if lexical and args.idf != "history":
+        corpus_counts = torch.zeros(len(tok), dtype=torch.float32)
+        for d in read_jsonl(args.idf)[:200]:
+            for i_, body in enumerate(d["turns"]):
+                corpus_counts += torch.bincount(torch.tensor(tok(turn_text(i_, body), add_special_tokens=False).input_ids), minlength=len(tok)).float()
+    sel = SelectConfig(
+        mode="oracle" if lexical else args.select, tau=args.tau, cap=args.cap, floor=args.floor, topk_frac=args.topk_frac, pool=args.pool,
+        alpha=args.alpha, agnostic_reduce=args.agnostic_reduce, agnostic_tau=args.agnostic_tau,
+        seg_gain=args.seg_gain, seg_tau=args.seg_tau, seg_cap=args.seg_cap, score_layer=args.score_layer, keep=args.keep,
+        query_last=args.query_last, pool_mode=args.pool_mode,
+    )
+    if ctx is not None:
+        ctx.select = sel
+    dialogues = read_jsonl(args.data)[: args.limit]
+
+    records = []
+
+    def run(batch, n_hist, fact_tok, fact_turn_span, rows_q, qmask=None, oracle=None):
+        """One forward. fact_tok / fact_turn_span: per row, token ranges of the fact sentence and of its turn."""
+        total = batch.input_ids.shape[1]
+        if ctx is not None:
+            ctx.set_segments(batch.segments, batch.update_flags)
+            ctx.last_weights, ctx.last_gains = {}, {}
+            ctx.query_span, ctx.query_mask = (None, qmask) if args.query_source != "tail" else ((n_hist, total), qmask)
+            ctx.oracle_weight = oracle
+        keep = total - min(r["answer_span"][0] for r in batch.rows) + 1
+        with torch.no_grad(), autocast(args):
+            logits = model(input_ids=batch.input_ids.to(args.device), logits_to_keep=keep).logits
+        scored = score_rows(logits, batch, offset=total - keep)
+        enrich, gain_fact, venrich = [None] * len(batch.rows), [None] * len(batch.rows), [None] * len(batch.rows)
+        if ctx is not None and ctx.last_weights:
+            wl = torch.stack([w.float().cpu() for w in ctx.last_weights.values()]).mean(dim=0)
+            for i in range(len(batch.rows)):
+                if fact_tok[i] is None:
+                    continue
+                (a_, b_, va_, vb_), (ts, te) = fact_tok[i], fact_turn_span[i]
+                turn_mean = wl[i, ts:te].mean().clamp_min(1e-9)
+                enrich[i] = float(wl[i, a_:b_].mean() / turn_mean)
+                venrich[i] = float(wl[i, va_:vb_].mean() / turn_mean)
+        if ctx is not None and ctx.last_gains:
+            gl = torch.stack([g.float().cpu() for g in ctx.last_gains.values()]).mean(dim=0)
+            for i in range(len(batch.rows)):
+                x = fact_turn_span[i][0]
+                j = next((j for j, (s_, e_) in enumerate(batch.segments) if s_ <= x < e_), None)
+                if j is not None:
+                    gain_fact[i] = float(gl[i, j])
+        out = []
+        for i, (sc, r) in enumerate(zip(scored, batch.rows)):
+            out.append({"query_index": sc["query_index"], "which": sc["which"], "exact": sc["exact"],
+                        "logprob": sc["logprob"], "enrichment": enrich[i], "fact_gain": gain_fact[i], "venrich": venrich[i],
+                        "distance_tokens": n_hist - fact_turn_span[i][1]})
+        return out
+
+    for di, dlg in enumerate(dialogues):
+        enc, offsets, texts = encode_with_offsets(dlg, tok)
+        batch = build_query_batch(enc, dlg["queries"], tok, tok.pad_token_id, args.max_segment, args.min_write_tokens)
+        n_hist = len(enc.history_ids)
+        total = batch.input_ids.shape[1]
+        queries = [dlg["queries"][r["query_index"]] for r in batch.rows]
+        fact_tok = [fact_sentence_tokens(q, enc, offsets, texts) for q in queries]
+        turn_span = [enc.turn_spans[q["fact_turn"]] for q in queries]
+        if ctx is not None:
+            ctx.query_q, ctx.query_prefix, ctx.capture_query = {}, 0, False
+
+        if args.query_source == "prefix":
+            # the question is put in front of every turn; one row at a time because rows differ in length
+            results = []
+            for i, r in enumerate(batch.rows):
+                qi_ids, nq = r["q_ids"], len(r["q_ids"])
+                ids, segs = [], []
+                for (ts, te) in enc.turn_spans:
+                    segs.append((len(ids), len(ids) + nq + te - ts))
+                    ids.extend(qi_ids + enc.history_ids[ts:te])
+                nh = len(ids)
+                seq = ids + qi_ids + r["a_ids"]
+                row = dict(r, answer_span=(nh + nq, nh + nq + len(r["a_ids"])))
+                one = type(batch)(torch.tensor([seq]), None, segs + [(nh, len(seq))], [True] * len(segs) + [False], [row])
+                t = queries[i]["fact_turn"]
+                shift = segs[t][0] + nq - enc.turn_spans[t][0]
+                ft = None if fact_tok[i] is None else tuple(x + shift for x in fact_tok[i])
+                if ctx is not None:
+                    ctx.query_prefix = nq
+                oracle = None
+                if sel.mode == "oracle":
+                    oracle = torch.ones(1, len(seq))
+                    if ft is not None:
+                        oracle[0, segs[t][0] : segs[t][1]] = args.oracle_low
+                        oracle[0, ft[0] : ft[1]] = args.oracle_high
+                results.extend(run(one, nh, [ft], [(segs[t][0] + nq, segs[t][1])], [queries[i]], None, oracle))
+            n_show = nh
+        else:
+            qmask = torch.zeros(len(batch.rows), total - n_hist, dtype=torch.bool)
+            for i, r in enumerate(batch.rows):
+                qmask[i, : len(r["q_ids"])] = True  # question tokens only: the answer must not steer the write
+            if args.query_source == "alone" and ctx is not None and (sel.mode in ("query", "hybrid") or args.replay == "pseudo"):
+                # the question alone, before any history: its read vectors are computed once and reused
+                nq = max(len(r["q_ids"]) for r in batch.rows)
+                qb = torch.full((len(batch.rows), nq), tok.pad_token_id, dtype=torch.long)
+                qmask = torch.zeros(len(batch.rows), nq, dtype=torch.bool)
+                for i, r in enumerate(batch.rows):
+                    qb[i, : len(r["q_ids"])] = torch.tensor(r["q_ids"])
+                    qmask[i, : len(r["q_ids"])] = True
+                ctx.capture_query = True
+                ctx.set_segments([(0, nq)], [False])
+                with torch.no_grad(), autocast(args):
+                    model(input_ids=qb.to(args.device), logits_to_keep=1)
+                ctx.capture_query = False
+            oracle = None
+            if lexical:
+                hist_t = torch.tensor(enc.history_ids)
+                counts = corpus_counts if corpus_counts is not None else torch.bincount(hist_t, minlength=len(tok)).float()
+                oracle = torch.ones(len(batch.rows), total)
+                for i, r in enumerate(batch.rows):
+                    rar = rarity(r["q_ids"], counts, float(counts.sum()))
+                    oracle[i, :n_hist] = lexical_weights(hist_t, r["q_ids"], rar, args.boost, args.pool, args.pool_mode, args.min_rarity)
+            elif sel.mode == "oracle":
+                oracle = torch.ones(len(batch.rows), total)
+                for i in range(len(batch.rows)):
+                    if fact_tok[i] is not None:
+                        oracle[i, turn_span[i][0] : turn_span[i][1]] = args.oracle_low
+                        oracle[i, fact_tok[i][0] : fact_tok[i][1]] = args.oracle_high
+            results = run(batch, n_hist, fact_tok, turn_span, queries, qmask, oracle)
+            n_show = n_hist
+
+        by_query = defaultdict(dict)
+        for res in results:
+            by_query[res["query_index"]][res["which"]] = res
+        for qi, q in enumerate(dlg["queries"]):
+            res = by_query[qi]
+            ans = res["answer"]
+            rec = {
+                "dialogue": dlg["id"], "category": q["category"], "distance_tokens": ans["distance_tokens"],
+                "fact_turn": q["fact_turn"], "num_turns": len(dlg["turns"]),
+                "bucket": distance_bucket(ans["distance_tokens"], args.window),
+                "exact": ans["exact"], "logprob": ans["logprob"],
+                "enrichment": ans["enrichment"], "fact_gain": ans["fact_gain"], "venrich": ans["venrich"],
+            }
+            if "old_answer" in res:
+                rec["prefers_old"] = res["old_answer"]["logprob"] > ans["logprob"]
+            records.append(rec)
+        print(f"[{di + 1}/{len(dialogues)}] history={n_show} tokens", flush=True)
+
+    summary = {}
+    groups = defaultdict(list)
+    for r in records:
+        groups[(r["category"], "all")].append(r)
+        groups[(r["category"], r["bucket"])].append(r)
+    for (cat, bucket), rs in sorted(groups.items()):
+        e = {"n": len(rs), "accuracy": sum(r["exact"] for r in rs) / len(rs),
+             "answer_logprob": sum(r["logprob"] for r in rs) / len(rs)}
+        en = [r["enrichment"] for r in rs if r["enrichment"] is not None]
+        if en:
+            e["enrichment"] = sum(en) / len(en)
+        ve = [r["venrich"] for r in rs if r["venrich"] is not None]
+        if ve:
+            e["venrich"] = sum(ve) / len(ve)
+        fg = [r["fact_gain"] for r in rs if r["fact_gain"] is not None]
+        if fg:
+            e["fact_gain"] = sum(fg) / len(fg)
+        olds = [r["prefers_old"] for r in rs if "prefers_old" in r]
+        if olds:
+            e["prefers_old_rate"] = sum(olds) / len(olds)
+        summary[f"{cat}/{bucket}"] = e
+
+    print(f"\nselect={args.select} boost={args.boost} idf={os.path.basename(args.idf)} source={args.query_source} tau={args.tau} cap={args.cap} seg_gain={args.seg_gain} "
+          f"keep={args.keep} pool={args.pool}/{args.pool_mode} qlast={args.query_last} topk={args.topk_frac} replay={args.replay or 'from-config'} probes={args.probe_src} target={args.pseudo_target} "
+          f"rkeep={args.replay_keep} samples={args.replay_samples} lr_scale={args.replay_lr_scale}")
+    print(f"{'category/bucket':32s} {'n':>5s} {'acc':>7s} {'logprob':>9s} {'enrich':>7s} {'venr':>7s} {'gain':>6s} {'old':>6s}")
+    for key, e in summary.items():
+        f = lambda k: f"{e[k]:.3f}" if k in e else ""
+        print(f"{key:32s} {e['n']:5d} {e['accuracy']:7.3f} {e['answer_logprob']:9.3f} "
+              f"{f('enrichment'):>7s} {f('venrich'):>7s} {f('fact_gain'):>6s} {f('prefers_old_rate'):>6s}")
+    if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w") as fo:
+            json.dump({"args": vars(args), "summary": summary, "records": records}, fo, indent=2)
+
+
+if __name__ == "__main__":
+    main()
