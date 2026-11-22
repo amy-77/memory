@@ -18,6 +18,10 @@ Qwen3-4B reproduces the official MemT results. The matrix update, 36 memory laye
 | A partial archive file was skipped forever because it already existed | Verify SHA-256 and replace mismatched files; write the move pointer before removing local large files; retain archived optimizer states |
 | Launchers executed an old external checkout | Resolve this repository's `framework/` relative to the launcher and accept paths through environment variables |
 | CPU BF16 base weights conflicted with FP32 memory projections | Enable CPU BF16 autocast as well as CUDA BF16 autocast |
+| Post-training could not resume, and checkpoints omitted RNG state | v3 checkpoints save each rank's actual data cursor and Python/NumPy/Torch CPU/CUDA RNG states, alongside weights and optimizer |
+| Resuming CUDA Adam moved CPU step counters onto the GPU | Deserialize on CPU; Adam relocates moment tensors to their parameters while retaining non-capturable counters on CPU |
+| A resumed partial logging interval divided loss by the full logging interval | Average over the updates actually observed since restart/last log |
+| An empty post-training source produced a successful step-zero final checkpoint | Fail with an explicit no-supervised-examples error |
 
 Losses and token counters exclude padding. Variable document lengths mean that
 4768 updates no longer imply exactly 5 billion processed tokens. Check
@@ -74,13 +78,27 @@ There are two distinct options:
    data. It cannot retroactively fix the training history of the old weights.
 
 For a clean comparison, train the corrected recipe from a new initialization.
-`--exact-text-resume` replays/tokenizes the data to the saved optimizer step; it
-does not yet implement an indexed token cache. It requires unchanged data and
-sharding. Old checkpoints do not record world size, so that must be kept manually.
-Exact RNG-state restoration for stochastic replay/dropout is not implemented;
-the tested deterministic text recipe uses no replay and Qwen3's zero attention
-dropout. A CPU stop/resume test matches uninterrupted weights bit for bit; GPU
-kernels and changed reduction order do not promise bitwise equivalence.
+New **v3** checkpoints include `training_state.pt`. All ranks contribute their
+actual consumed-example cursor and Python/NumPy/Torch CPU/CUDA RNG states before
+rank zero atomically publishes the checkpoint. Publication errors are reported
+to every rank. The selector rejects a v3 checkpoint missing its runtime state;
+the archiver preserves that state and the format marker.
+
+V3 `--resume` automatically replays the saved iterator position, then restores RNG
+after model/teacher loading and data replay. It requires unchanged device type, world size,
+data/sharding, model/tokenizer, attention, loss and optimizer settings. Single-file
+sources (including post-training JSONL and text JSONL/TXT) are SHA-256 checked.
+HF streams and Arrow datasets still require an externally immutable revision;
+replacing model/tokenizer weights under an unchanged path is also unsupported.
+This is replay-based seeking, not an indexed token cache; replaying a large CPT
+dataset can take time. No already-consumed example is trained again.
+
+For older checkpoints, `--exact-text-resume` retains the legacy text-replay option.
+Missing RNG snapshots produce a warning: old stochastic training history cannot
+be reconstructed exactly. Old checkpoints without world size require keeping it
+manually. CPU tests cover dropout and uneven two-rank post-training; equal results
+in a fixed environment do not guarantee bitwise equality across GPU types, library
+versions or reduction algorithms.
 
 ## Post-training
 
@@ -105,8 +123,13 @@ torchrun --standalone --nproc_per_node 8 codex版本/framework/scripts/train_mem
 The numerical schedule above is an example, not an inferred size of your data.
 The one-pass iterator stops at exhaustion or the requested step limit. If it
 ends early, the scheduler does not retroactively compress its decay phase.
-`final/memory_config.json` records `step` and `data_exhausted`. Mid-pass post-training
-`--resume` remains explicitly unsupported; starting from weights is a new stage.
+`final/memory_config.json` records `step` and `data_exhausted`. To resume mid-pass,
+rerun the same command with `--resume /path/to/post_run/step_500` (replace the step
+with the checkpoint you actually saved), retaining the original total `--steps`,
+world size, accumulation and teacher/cache configuration. Remove `--stop-at` if
+it was used for the interruption. V3 restores the actual per-rank cursor, including
+uneven final batches; synthetic padding does not advance the source cursor.
+Changing the JSONL source is rejected. Using `--memory` instead starts a new stage.
 The current repository does not supply the official post-training dataset or
 its entire generation pipeline, so fixing the trainer does not complete that stage.
 `cache_teacher.py` caches the distributions for existing teacher-generated responses;

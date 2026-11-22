@@ -26,12 +26,14 @@ NPROC_PER_NODE=8 bash codex版本/train_run/train_8gpu.sh
 默认保留原有的 36 层记忆结构，使用 PyTorch 写入实现。
 可选 FLA/KDA 必须先按 [参考说明](REFERENCES.md) 安装并验证，再显式启用。
 H20 的写入数值检查已通过，但本次 FP32 微基准未显示提速，因此仍属实验选项。
-本版已通过 40 项 CPU 测试、3 项 CUDA 测试和独立长序列写入检查；完整 4B 重训
-和下游任务精度尚未验证。
+本版已通过 46 项 CPU 测试，以及 H20 上的 CUDA 后端、随机状态、双卡 NCCL 续训
+和独立长序列写入检查。完整 4B 重训和下游任务精度尚未验证。
 
 当前修复包括：正确选择完整 checkpoint、真正生效的学习率下限、文档隔离、
 按有效 token 归一化、多卡有限数据结束同步、梯度累积期间减少通信，以及
 按 token 分块并重计算词表损失。权重格式兼容旧模型；改变数据策略应新开实验。
+新版 checkpoint 另存各个 rank 的数据位置和随机状态，支持后训练中断恢复，
+校验 JSONL 是否变化，并把 checkpoint 保存失败同步报告给所有 rank。
 
 `locomo_eval/`、`train_run/step_2160_memory_config.json` 和
 `heldout_eval_summary.txt` 是保留的历史参考，不代表此版本重训后的成绩。

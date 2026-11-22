@@ -9,10 +9,10 @@
 ```bash
 OMP_NUM_THREADS=2 PYTHONDONTWRITEBYTECODE=1 \
 python -m pytest codex版本/framework/tests -q -p no:cacheprovider
-# 40 passed, 3 skipped, 16 warnings in 27.29s
+# 46 passed, 4 skipped, 16 warnings in 49.32s
 ```
 
-三个跳过项需要 CUDA，其中两个还需要可选 FLA 依赖。测试使用本地创建的微型 Qwen3，
+四个跳过项需要 CUDA，其中两个还需要可选 FLA 依赖。测试使用本地创建的微型 Qwen3，
 无需下载预训练模型。关键覆盖如下：
 
 | 检查 | 结果 |
@@ -24,6 +24,9 @@ python -m pytest codex版本/framework/tests -q -p no:cacheprovider
 | 文档边界与 padding | 不混入其他文档，padding 不参与损失；长文档分段保留边界目标 |
 | Checkpoint 与归档 | 按数字选取完整版本，拒绝未完成保存，修复部分复制的归档 |
 | 激活重计算 | 微型模型的记忆参数获得正确梯度 |
+| v3 随机状态与后训练恢复 | dropout=0.2、双 rank 不等长数据，中断/恢复后的权重、优化器、各 rank 随机状态和数据位置与连续训练逐位一致 |
+| 源文件和保存失败 | 改变 JSONL 后拒绝恢复；空后训练数据不会生成成功的 final；rank 0 保存失败明确通知两个 rank |
+| 恢复后的日志 | 改变日志间隔后，恢复后的单步 loss/KL 与连续训练同一步一致 |
 
 Python 语法、三个训练/归档入口的 Bash 语法和 Git 空白检查也已通过。
 
@@ -75,6 +78,33 @@ python -m pytest codex版本/framework/tests/test_kda_cuda.py -q -p no:cacheprov
 GPU 在测量期间出现其他训练负载，因此这些数字不是可靠的独占性能比较；
 即便如此，本次也没有证据证明 KDA 在该 FP32 配置下更快或更省显存，不能把
 它作为默认加速方案。上述内存仅是写入检查的增量，不是完整模型峰值显存。
+
+## CUDA 随机状态和双卡 NCCL 恢复
+
+在同一 H20 / PyTorch 2.14.1+cu130 环境中，额外完成了以下检查：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 MEMT_TEST_DEVICE=cuda NCCL_NVLS_ENABLE=0 \
+OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest \
+  codex版本/framework/tests/test_training_state.py \
+  codex版本/framework/tests/test_training_integration.py::test_ddp_post_resume_preserves_dropout_rng_cursor_optimizer_and_logs \
+  codex版本/framework/tests/test_training_integration.py::test_ddp_checkpoint_writer_failure_reaches_every_rank \
+  -q -p no:cacheprovider
+# 5 passed in 55.46s
+```
+
+覆盖 CPU/CUDA 随机状态序列化往返、数据游标回放、真实双卡 NCCL 的中断恢复和
+rank 0 保存失败传播。恢复测试使用微型 Qwen3、`attention_dropout=0.2`、
+7 条后训练轨迹、每 rank batch=1、梯度累积 2；最后一批在两个 rank 上不等长。
+
+连续训练与停在 step 1 后恢复，两者的最终权重、完整优化器状态、各 rank 的
+Python/NumPy/Torch CPU/CUDA 随机状态都逐位一致，实际数据游标分别为 `[4, 3]`。
+保存失败检查确认两个 rank 都收到明确错误，未生成假成功的 `final/`。
+
+测试还发现并修复了 CUDA 优化器恢复时的设备变化：整份 optimizer 用 CUDA
+反序列化会把非 capturable Adam 的 CPU 步数计数器搬到 GPU。现在先在 CPU
+加载，由 Adam 将矩张量放到参数设备，恢复后状态的数值和设备都与连续训练一致。
+这些结论只覆盖记录的固定环境与微型模型，不等于全尺寸训练或跨环境逐位一致保证。
 
 ## 这些检查不能证明什么
 

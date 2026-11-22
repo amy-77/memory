@@ -31,7 +31,9 @@ import random
 import shutil
 import sys
 import time
+import warnings
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -43,9 +45,11 @@ from lact_qwen.training_loss import MemoryTrainingLoss
 from lact_qwen.memory_branch import LaCTMemoryBranch
 from lact_qwen.loading import add_model_args, autocast, load_model, load_teacher, load_tokenizer
 from lact_qwen.modeling import CONFIG_NAME, freeze_base, memory_parameters, save_memory
-from lact_qwen.checkpointing import OPTIMIZER_NAME, save_training_checkpoint
+from lact_qwen.checkpointing import OPTIMIZER_NAME, RUNTIME_NAME
 from lact_qwen.training_data import optimizer_batch
-from lact_qwen.teacher_cache import TeacherCache
+from lact_qwen.teacher_cache import TeacherCache, file_sha256
+from lact_qwen.training_state import (capture_runtime, restore_rng, replay_iterator,
+                                      save_rank_checkpoint, raise_rank_errors)
 
 from lact_qwen.synth import read_jsonl
 from lact_qwen.text_data import document_sequences, packed_sequences
@@ -217,7 +221,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--progress-file", default=None, help="atomic rank-zero progress JSON")
     p.add_argument("--save-initial", default=None, help="save synchronized step-zero memory before training")
-    p.add_argument("--exact-text-resume", action="store_true", help="replay the original text iterator to the saved optimizer step")
+    p.add_argument("--exact-text-resume", action="store_true",
+                   help="replay legacy text checkpoints; v3 checkpoints always restore their data cursor")
     p.add_argument("--fail-on-nonfinite", action="store_true")
     p.add_argument("--stable-grad-norm", action="store_true", help="reduce gradient norms in FP64")
     p.add_argument("--save-on-nonfinite", action="store_true",
@@ -226,6 +231,9 @@ def main():
     # --model、--window、--memory、--mem-* 等模型结构参数定义在 lact_qwen/loading.py。
     add_model_args(p)
     args = p.parse_args()
+    kind, spec = args.data.split(":", 1)
+    if kind not in ("text", "synth", "post"):
+        raise ValueError("--data must start with text:, synth:, or post:")
     if args.teacher_cache and (not args.data.startswith("post:") or args.distill_top_k <= 0 or args.distill_weight <= 0):
         raise ValueError("teacher caches require post: data, positive distillation weight and Top-K")
     if min(args.steps, args.grad_accum, args.batch_size, args.log_every, args.save_every,
@@ -238,8 +246,8 @@ def main():
     if args.decay_steps < 0 or args.decay_steps > args.steps - args.warmup:
         raise ValueError("decay_steps must fit after warmup")
     if args.data.startswith("post:"):
-        if args.batch_size != 1 or args.resume:
-            raise ValueError("one-pass post data currently requires batch=1 and no --resume")
+        if args.batch_size != 1:
+            raise ValueError("one-pass post data requires batch=1")
         if args.attn_segment <= 0 or args.window != args.attn_segment or args.sinks != 0:
             raise ValueError("post-training requires current-segment-only attention and zero sinks")
         if args.ce_weight != 0 or args.distill_weight <= 0:
@@ -257,6 +265,23 @@ def main():
             args.device = f"cuda:{local}"
         dist.init_process_group("nccl" if args.device.startswith("cuda") else "gloo")
     torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
+    np.random.seed((args.seed + rank) % 2**32)
+
+    # Hash single-file sources, including all post-training JSONL. Remote/HF sources
+    # still require an immutable external dataset revision and unchanged shards.
+    source_sha256, source_error = None, None
+    try:
+        if os.path.isfile(spec) and not spec.endswith(".arrow"):
+            source_sha256 = file_sha256(spec)
+    except Exception as exc:
+        source_error = f"{type(exc).__name__}: {exc}"
+    raise_rank_errors(source_error, "training source fingerprint")
+    if world > 1:
+        hashes = [None] * world
+        dist.all_gather_object(hashes, source_sha256)
+        if len(set(hashes)) != 1:
+            raise ValueError("ranks must read the same source file before sharding")
 
     if args.resume:
         # 分支结构（头数、初始化方式等）以检查点为准，续训时不用再传一遍 --mem-*。
@@ -315,8 +340,12 @@ def main():
     start = 0
     processed_tokens = 0
     processed_before_resume_known = True
+    resume_runtime = None
     if args.resume:
-        opt.load_state_dict(torch.load(os.path.join(args.resume, OPTIMIZER_NAME), map_location=args.device))
+        # Adam relocates moment tensors to each parameter's device itself. Loading
+        # everything onto CUDA also moves non-capturable step counters off CPU.
+        opt.load_state_dict(torch.load(os.path.join(args.resume, OPTIMIZER_NAME),
+                                       map_location="cpu", weights_only=True))
         with open(os.path.join(args.resume, CONFIG_NAME)) as f:
             resume_meta = json.load(f)
         start = resume_meta["step"]
@@ -338,24 +367,42 @@ def main():
             for key in ("legacy_cosine", "min_lr_ratio"):
                 if key in old_args and old_args[key] != getattr(args, key):
                     raise ValueError(f"resume requires unchanged {key}")
-        if args.exact_text_resume:
+        if resume_meta.get("training_version", 1) >= 3:
+            if not os.path.isfile(os.path.join(args.resume, "COMPLETE")):
+                raise ValueError("cannot resume an unpublished checkpoint")
+            saved_runtime = torch.load(os.path.join(args.resume, RUNTIME_NAME),
+                                       map_location="cpu", weights_only=True)
+            if saved_runtime.get("format_version") != 1 or len(saved_runtime["ranks"]) != world:
+                raise ValueError("checkpoint runtime requires an unchanged world_size and supported format")
+            resume_runtime = saved_runtime["ranks"][rank]
+            if resume_meta.get("source_sha256") != source_sha256:
+                raise ValueError("training source SHA-256 changed since checkpoint; use --memory for a new stage")
+            if resume_meta.get("memory") != mem_cfg.to_dict():
+                raise ValueError("resume cannot change memory configuration; use --memory for a new stage")
+        else:
+            warnings.warn("legacy checkpoint has no RNG snapshot; stochastic continuation is not exact")
+        if args.exact_text_resume or kind == "post" or resume_runtime is not None:
             for key in ("data", "seq_len", "batch_size", "grad_accum", "seed", "shuffle_buffer", "min_doc_tokens"):
                 if key in old_args and old_args[key] != getattr(args, key):
-                    raise ValueError(f"exact text resume requires unchanged {key}")
+                    raise ValueError(f"data cursor resume requires unchanged {key}")
             if resume_meta.get("world_size", world) != world:
-                raise ValueError("exact text resume requires unchanged world_size")
+                raise ValueError("data cursor resume requires unchanged world_size")
+        if resume_runtime is not None:
+            for key in ("dtype", "tokenizer", "attn_impl", "window", "sinks", "attn_segment",
+                        "teacher_cache", "loss_on", "query_categories", "max_segment",
+                        "min_write_tokens", "stable_grad_norm"):
+                if key in old_args and old_args[key] != getattr(args, key):
+                    raise ValueError(f"resume requires unchanged {key}; use --memory for a new stage")
         processed_tokens = resume_meta.get("processed_tokens", 0)
         processed_before_resume_known = resume_meta.get("processed_before_resume_known", "processed_tokens" in resume_meta)
         if rank == 0:
             print(f"resumed from {args.resume} at step {start}")
 
-    # Exact text resume replays the original iterator. Without it, use a fresh data pass.
-    data_seed = args.seed if args.exact_text_resume else args.seed + start
-    kind, spec = args.data.split(":", 1)
+    # v3 captures the actual per-rank cursor (excluding synthetic padding batches).
+    data_seed = (resume_runtime["data_seed"] if resume_runtime is not None else
+                 args.seed if args.exact_text_resume or kind == "post" else args.seed + start)
     if kind == "text":
         batches = text_batches(spec, tok, args, rank, world, data_seed)
-        if args.exact_text_resume and start:
-            batches = itertools.islice(batches, start * args.grad_accum, None)
     elif kind == "synth":
         cats = set(args.query_categories.split(",")) if args.query_categories else None
         batches = synth_batches(spec, tok, args.loss_on, args.max_segment, rank, data_seed, cats, args.min_write_tokens)
@@ -367,9 +414,15 @@ def main():
         batches = post_batches(spec, args.attn_segment, args.seq_len, rank, world, teacher_cache)
     else:
         raise SystemExit("--data must start with text:, synth:, or post:")
+    consumed = (resume_runtime["consumed_batches"] if resume_runtime is not None else
+                start * args.grad_accum if kind == "post" or (kind == "text" and args.exact_text_resume) else 0)
+    batches = replay_iterator(batches, consumed)
+    if resume_runtime is not None:
+        restore_rng(resume_runtime, args.device)
 
     branches = [m for m in core.modules() if isinstance(m, LaCTMemoryBranch)]
     t0, tokens, run_loss, run_kl = time.time(), 0, 0.0, 0.0
+    run_steps = 0
     run_started = time.time()
     batch_audit = []
     stopped = False
@@ -379,9 +432,17 @@ def main():
     def checkpoint_metadata(completed_step):
         return {"step": completed_step, "data": args.data, "training_args": vars(args),
                 "world_size": world, "processed_tokens": processed_tokens,
-                "processed_before_resume_known": processed_before_resume_known}
+                "processed_before_resume_known": processed_before_resume_known,
+                "source_sha256": source_sha256}
+
+    def save_checkpoint(destination, completed_step, *, runtime=None, **extra):
+        runtime = (capture_runtime(args.device, batches.consumed, data_seed)
+                   if runtime is None else runtime)
+        save_rank_checkpoint(core, opt, destination, {**checkpoint_metadata(completed_step), **extra}, runtime)
     # start 是已经完成的步数。检查点 step_160 表示 160 步已完成，这里从 160 继续，下一次保存是 step_161。
     for step in range(start, args.steps):
+        before_batch = (capture_runtime(args.device, batches.consumed, data_seed)
+                        if args.save_on_nonfinite else None)
         for g in opt.param_groups:
             rate = (wsd_lr_at(step, args.lr, args.warmup, args.steps, args.decay_steps, args.min_lr_ratio)
                     if args.lr_schedule == "wsd" else lr_at(step, args.lr, args.warmup, args.steps,
@@ -391,6 +452,8 @@ def main():
         if microbatches is None:
             if kind != "post":
                 raise ValueError("no usable training text; check the source, filters and rank sharding")
+            if completed == 0:
+                raise ValueError("post-training source contains no supervised examples")
             exhausted = True
             break
         global_count = counts[0]
@@ -436,29 +499,36 @@ def main():
             dist.all_reduce(step_metrics)
         run_loss += (step_metrics[0] / global_count).item()
         run_kl += (step_metrics[1] / global_count).item()
+        run_steps += 1
         clip_function = clip_grad_norm_fp64 if args.stable_grad_norm else torch.nn.utils.clip_grad_norm_
         try:
             grad_norm = clip_function(params, args.clip, error_if_nonfinite=args.fail_on_nonfinite)
         except RuntimeError as exc:
             if not args.save_on_nonfinite:
                 raise
+            weights_finite = torch.tensor(int(all(bool(torch.isfinite(parameter).all()) for parameter in params)),
+                                          device=args.device)
+            if world > 1:
+                dist.all_reduce(weights_finite, op=dist.ReduceOp.MIN)
+            report, report_error = None, None
             if rank == 0:
                 bad = [name for name, parameter in core.named_parameters()
                        if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())]
-                weights_finite = all(bool(torch.isfinite(parameter).all()) for parameter in params)
                 report = dict(completed_step=step, failed_step=step + 1,
                               error=str(exc), bad_gradient_parameters=bad,
-                              trainable_weights_finite=weights_finite)
-                os.makedirs(args.out, exist_ok=True)
-                with open(os.path.join(args.out, f"nonfinite_step_{step + 1}.json"), "w") as f:
-                    json.dump(report, f, indent=2)
-                if weights_finite:
-                    ckpt = os.path.join(args.out, f"nonfinite_before_{step + 1}")
-                    save_training_checkpoint(core, opt, ckpt,
-                                             {**checkpoint_metadata(step), "nonfinite_diagnostic": report})
+                              trainable_weights_finite=bool(weights_finite))
+                try:
+                    os.makedirs(args.out, exist_ok=True)
+                    with open(os.path.join(args.out, f"nonfinite_step_{step + 1}.json"), "w") as f:
+                        json.dump(report, f, indent=2)
+                except Exception as report_exc:
+                    report_error = str(report_exc)
+            raise_rank_errors(report_error, "nonfinite diagnostic")
+            if bool(weights_finite):
+                ckpt = os.path.join(args.out, f"nonfinite_before_{step + 1}")
+                save_checkpoint(ckpt, step, runtime=before_batch, nonfinite_diagnostic=report)
+                if rank == 0:
                     print(f"NONFINITE_PREUPDATE_CHECKPOINT_SAVED {ckpt}", flush=True)
-            if world > 1:
-                dist.barrier()
             raise
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -472,8 +542,8 @@ def main():
             gate = torch.stack([m.scale_stat().float() for m in branches]).mean().item()
             mem = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
             print(
-                f"step {step + 1} loss {run_loss / args.log_every:.4f} "
-                + (f"kl {run_kl / args.log_every:.4f} " if args.distill_weight > 0 else "")
+                f"step {step + 1} loss {run_loss / run_steps:.4f} "
+                + (f"kl {run_kl / run_steps:.4f} " if args.distill_weight > 0 else "")
                 + f"lr {opt.param_groups[0]['lr']:.2e} "
                 f"|gate| {gate:.4f} tok/s {tokens / dt:.0f} peak_mem {mem:.1f}G",
                 flush=True,
@@ -484,7 +554,7 @@ def main():
                     global_batch=world * args.batch_size * args.grad_accum,
                     processed_tokens=processed_tokens,
                     processed_before_resume_known=processed_before_resume_known,
-                    ce=run_loss / args.log_every, kl=run_kl / args.log_every,
+                    ce=run_loss / run_steps, kl=run_kl / run_steps, updates_since_log=run_steps,
                     learning_rate=opt.param_groups[0]["lr"], rank0_grad_norm=float(grad_norm),
                     tokens_per_second=tokens / dt, rank0_peak_gib=mem,
                     elapsed_seconds=time.time()-run_started)
@@ -492,14 +562,15 @@ def main():
                     json.dump(record, f, indent=2, allow_nan=False)
                 os.replace(args.progress_file + ".tmp", args.progress_file)
             t0, tokens, run_loss, run_kl = time.time(), 0, 0.0, 0.0
+            run_steps = 0
         if args.batch_audit_dir and step == start:
             os.makedirs(args.batch_audit_dir, exist_ok=True)
             with open(os.path.join(args.batch_audit_dir, f"rank{rank}.json"), "w") as f:
                 json.dump(batch_audit, f, indent=2)
-        if rank == 0 and ((step + 1) % args.save_every == 0 or step + 1 in args.save_at):
+        if (step + 1) % args.save_every == 0 or step + 1 in args.save_at:
             ckpt = os.path.join(args.out, f"step_{step + 1}")
-            save_training_checkpoint(core, opt, ckpt, checkpoint_metadata(step + 1))
-            if args.keep_last > 0:
+            save_checkpoint(ckpt, step + 1)
+            if rank == 0 and args.keep_last > 0:
                 old = sorted(
                     (d for d in os.listdir(args.out) if d.startswith("step_") and d[5:].isdigit()),
                     key=lambda d: int(d.split("_")[1])
@@ -508,19 +579,19 @@ def main():
                     shutil.rmtree(os.path.join(args.out, d))
         if args.stop_at and step + 1 >= args.stop_at:
             # 停在不是 save_every 整数倍的步数时，这里补存一次，避免这个点没有检查点。
-            if rank == 0 and (step + 1) % args.save_every != 0 and step + 1 not in args.save_at:
+            if (step + 1) % args.save_every != 0 and step + 1 not in args.save_at:
                 ckpt = os.path.join(args.out, f"step_{step + 1}")
-                save_training_checkpoint(core, opt, ckpt, checkpoint_metadata(step + 1))
+                save_checkpoint(ckpt, step + 1)
             if rank == 0:
                 print(f"stopped at step {step + 1} (--stop-at)")
             stopped = True
             break
 
     # --stop-at 提前退出时不写 final/，避免把一个中间步误当成训练结束。
-    if rank == 0 and not stopped:
-        save_training_checkpoint(core, opt, os.path.join(args.out, "final"),
-                                 {**checkpoint_metadata(completed), "data_exhausted": exhausted})
-        print(f"saved {os.path.join(args.out, 'final')}")
+    if not stopped:
+        save_checkpoint(os.path.join(args.out, "final"), completed, data_exhausted=exhausted)
+        if rank == 0:
+            print(f"saved {os.path.join(args.out, 'final')}")
     if world > 1:
         dist.destroy_process_group()
 

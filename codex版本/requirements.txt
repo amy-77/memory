@@ -4,4 +4,5 @@ torch>=2.11,<2.15
 transformers==5.20.2
 datasets==5.1.0
 einops==0.8.2
+numpy>=1.26,<3
 pytest>=8,<10

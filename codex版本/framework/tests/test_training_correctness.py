@@ -7,7 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from lact_qwen.checkpointing import latest_checkpoint, save_training_checkpoint, archive_checkpoint
+from lact_qwen.checkpointing import latest_checkpoint, save_training_checkpoint, archive_checkpoint, RUNTIME_NAME
+from lact_qwen.training_state import capture_runtime
 from lact_qwen.distill import ce_and_kl
 from lact_qwen.memory_branch import MemoryConfig
 from lact_qwen.modeling import attach_memory, freeze_base, memory_parameters, set_attention_window
@@ -161,6 +162,22 @@ def test_archive_repairs_partial_copy_before_removing_local_files(tmp_path, tiny
     assert (destination / "COMPLETE").is_file()
     assert not (source / "memory_weights.pt").exists()
     assert latest_checkpoint(source.parent) == str(destination)
+
+
+def test_runtime_checkpoint_requires_and_archives_rank_state(tmp_path, tiny_model):
+    model = setup_memory(tiny_model)
+    opt = torch.optim.AdamW(memory_parameters(model))
+    source, destination = tmp_path / "local/step_4", tmp_path / "archive/step_4"
+    runtime = {"format_version": 1, "ranks": [capture_runtime("cpu", 7, 42)]}
+    save_training_checkpoint(model, opt, source, {"step": 4}, runtime_state=runtime)
+    assert (source / "COMPLETE").read_text() == "3\n"
+    archive_checkpoint(source, destination, move=True)
+    assert (destination / "COMPLETE").read_text() == "3\n"
+    loaded = torch.load(destination / RUNTIME_NAME, weights_only=True)
+    assert loaded["ranks"][0]["consumed_batches"] == 7
+    assert latest_checkpoint(source.parent) == str(destination)
+    (destination / RUNTIME_NAME).unlink()
+    assert latest_checkpoint(source.parent) is None
 
 
 @pytest.mark.parametrize("temperature", [1., 1.7])
