@@ -40,18 +40,36 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("--tp", type=int, default=2)
+    ap.add_argument("--cache", default="out/judge_cache.json",
+                    help="verdict per (question, gold, prediction), shared by all runs so equal answers get equal verdicts")
+    ap.add_argument("--seed-from", default=None, help="add the verdicts of <dir>/*.judged.json to the cache first")
     args = ap.parse_args()
+    cache = json.load(open(args.cache)) if os.path.exists(args.cache) else {}
+    ck = lambda q, g, p: json.dumps([q, g, p])
+    if args.seed_from:
+        for f in glob.glob(args.seed_from + "/*.judged.json"):
+            for r in json.load(open(f))["records"]:
+                cache.setdefault(ck(r["question"], str(r["answer"]), r["pred"]), bool(r["judge"]))
     runs = {os.path.basename(f)[:-5]: json.load(open(f))["records"]
             for f in sorted(glob.glob(args.dir + "/*.json")) if ".s" not in os.path.basename(f) and "judged" not in f}
     runs = {k: v for k, v in runs.items() if v and v[0].get("pred") is not None}
-    keys = sorted({(r["question"], str(r["answer"]), r["pred"]) for rs in runs.values() for r in rs})
-    print("runs", list(runs), "distinct (question, gold, prediction) triples", len(keys), flush=True)
-    from vllm import LLM, SamplingParams
-    llm = LLM(model=JUDGE, tensor_parallel_size=args.tp, max_model_len=4096, gpu_memory_utilization=0.85)
-    msgs = [[{"role": "user", "content": PROMPT.format(q=q.replace("Question:", "").replace("Answer:", "").strip(), gold=g, pred=p or "(empty)")}]
+    allkeys = sorted({(r["question"], str(r["answer"]), r["pred"]) for rs in runs.values() for r in rs})
+    keys = [k for k in allkeys if ck(*k) not in cache]
+    print("runs", list(runs), "distinct triples", len(allkeys), "already in the cache", len(allkeys) - len(keys), flush=True)
+    verdict = {k: cache[ck(*k)] for k in allkeys if ck(*k) in cache}
+    if not keys:
+        LLM = None
+    else:
+        from vllm import LLM, SamplingParams
+    if keys:
+      llm = LLM(model=JUDGE, tensor_parallel_size=args.tp, max_model_len=4096, gpu_memory_utilization=0.85)
+      msgs = [[{"role": "user", "content": PROMPT.format(q=q.replace("Question:", "").replace("Answer:", "").strip(), gold=g, pred=p or "(empty)")}]
             for q, g, p in keys]
-    outs = llm.chat(msgs, SamplingParams(temperature=0, max_tokens=8), chat_template_kwargs={"enable_thinking": False})
-    verdict = {k: ("CORRECT" in o.outputs[0].text.upper() and "WRONG" not in o.outputs[0].text.upper()) for k, o in zip(keys, outs)}
+      outs = llm.chat(msgs, SamplingParams(temperature=0, max_tokens=8), chat_template_kwargs={"enable_thinking": False})
+      for k, o in zip(keys, outs):
+          verdict[k] = "CORRECT" in o.outputs[0].text.upper() and "WRONG" not in o.outputs[0].text.upper()
+          cache[ck(*k)] = verdict[k]
+      json.dump(cache, open(args.cache, "w"))
     cats = ["ALL", "single_hop", "multi_hop", "temporal", "open_domain"]
     for b in ("beyond", "inside"):
         print(f"\n### evidence {b} the 2048-token window: judged correct / total (mean F1)")

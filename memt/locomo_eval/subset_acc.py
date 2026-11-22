@@ -17,8 +17,9 @@ for n, R in runs.items():
 names = list(runs)
 print("\npaired: questions only X gets right / only Y gets right")
 for x, y in [("C_write", "B_last"), ("C_write", "W_wrong"), ("F_evidence", "C_write"), ("F_evidence", "G_random"),
-             ("S_qk", "G_random"), ("S_qk", "F_evidence"), ("A_full", "C_write")]:
+             ("S_qk", "G_random"), ("S_qk", "F_evidence"), ("A_full", "C_write"),
+             ("C_write_R16", "C_write"), ("S_qk_R16", "S_qk"), ("F_evidence_R16", "F_evidence")]:
     if x in runs and y in runs:
         a = sum(runs[x][k]["judge"] and not runs[y][k]["judge"] for k in ks)
         b = sum(runs[y][k]["judge"] and not runs[x][k]["judge"] for k in ks)
-        print(f"  {x:11s} vs {y:11s}: only {x[0]} right {a:4d}, only {y[0]} right {b:4d}")
+        print(f"  {x:15s} vs {y:11s}: only first right {a:4d}, only second right {b:4d}")

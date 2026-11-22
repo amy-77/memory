@@ -95,6 +95,9 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="only the first N rows (smoke test)")
     p.add_argument("--gen", type=int, default=24, help="greedy-decode up to N tokens after the question; 0 = off")
     p.add_argument("--reserve", type=int, default=64, help="tokens kept free at the end of the last chunk")
+    p.add_argument("--replay-k", type=int, default=0,
+                   help="Robins-style rehearsal with the question's own memory queries: probes per head; 0 = off")
+    p.add_argument("--replay-alpha", type=float, default=1.0, help="rehearsal strength (1 = restore the read-out)")
     p.add_argument("--out", required=True)
     add_model_args(p)
     args = p.parse_args()
@@ -107,6 +110,10 @@ def main():
     else:
         assert cfg is not None and cfg.chunk_size == args.chunk
     dev = next(model.parameters()).device
+    R_ = None
+    if args.replay_k:
+        import replay_patch as R_
+        R_.install(); R_.REPLAY["k"], R_.REPLAY["alpha"] = args.replay_k, args.replay_alpha
     scorer = None
     if args.mode == "qk":
         from lact_qwen.loading import load_teacher   # frozen base model, full attention, no memory
@@ -182,6 +189,16 @@ def main():
                         n_written += len(flags); n_chunks += len(earlier)
                         if args.mode in ("evidence", "random", "qk"):
                             n_ev += len(evid); n_hit += len(evid & flags)
+                        if R_ is not None:
+                            # probe queries = the question's own memory queries, taken from a forward of the chunk
+                            # that holds the question with an empty memory (the question is known in advance)
+                            begin_stream(model, C)
+                            R_.REPLAY["q"], R_.REPLAY["captured"] = None, {}
+                            R_.REPLAY["capture"] = (len(hist) - fs, P - fs)
+                            forward_chunk(model, torch.tensor([seq[fs:P]], device=dev), fs, update=False)
+                            R_.REPLAY["capture"] = None
+                            R_.REPLAY["q"] = dict(R_.REPLAY["captured"])
+                            end_stream(model)
                         begin_stream(model, C)
                         if args.mode == "wrong":
                             dh = donor_hist[conv(dlg)]
@@ -194,6 +211,8 @@ def main():
                             if j in flags:
                                 s_, e_ = bounds[j]
                                 forward_chunk(model, torch.tensor([seq[s_:e_]], device=dev), s_, update=True)
+                        if R_ is not None:
+                            R_.REPLAY["q"] = None
                         # the last chunk only reads: every token of a chunk reads the state left by the earlier
                         # chunks (memory_branch._read_matrix), so update=False gives the same output as in training
                         step = lambda ids: forward_chunk(model, torch.tensor([ids], device=dev), fs, update=False)
@@ -220,6 +239,11 @@ def main():
         if len(recs) and ri % 20 == args.shard:
             print(f"row {ri+1}/{len(rows)} questions {len(recs)} {time.time()-t0:.0f}s", flush=True)
     summ = {"written_chunks": n_written, "earlier_chunks": n_chunks, "evidence_chunks": n_ev, "evidence_chunks_written": n_hit}
+    if R_ is not None:
+        st = R_.REPLAY["stats"]
+        summ["replay"] = {"layer_writes": st["writes"], "layer_writes_with_rehearsal": st["replayed"],
+                          "mean_relative_restore_error": st["restore_err"] / max(1, st["restore_n"])}
+        print("replay", summ["replay"], flush=True)
     print("chunks written", n_written, "of", n_chunks, "earlier chunks; evidence chunks written", n_hit, "of", n_ev, flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     json.dump({"args": vars(args), "summary": summ, "records": recs}, open(args.out, "w"))
