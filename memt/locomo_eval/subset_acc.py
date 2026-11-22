@@ -21,7 +21,8 @@ for x, y in [("C_write", "B_last"), ("C_write", "W_wrong"), ("F_evidence", "C_wr
              ("C_write_R16", "C_write"), ("S_qk_R16", "S_qk"), ("F_evidence_R16", "F_evidence"),
              ("K2_bm25", "K2_random"), ("K2_bm25", "C_write"), ("K2_bm25", "S_qk"), ("K2_bm25", "F_evidence"),
              ("K1_bm25", "K2_bm25"), ("K3_bm25", "K2_bm25"), ("K2_rrf", "K2_bm25"), ("K2_attmax", "K2_random"),
-             ("K2_random", "C_write")]:
+             ("K2_random", "C_write"), ("K2_attc", "K2_random"), ("K2_attc", "K2_bm25"), ("K2_attc", "S_qk"),
+             ("K2_attc", "C_write")]:
     if x in runs and y in runs:
         a = sum(runs[x][k]["judge"] and not runs[y][k]["judge"] for k in ks)
         b = sum(runs[y][k]["judge"] and not runs[x][k]["judge"] for k in ks)

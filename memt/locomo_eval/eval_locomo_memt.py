@@ -127,9 +127,14 @@ def main():
 
     SC = {}
     if args.mode == "scored":
-        for f in glob.glob(args.scores):
-            for r_ in json.load(open(f)):
-                SC[(r_["row"], r_["query_index"])] = r_
+        for pat in args.scores.split(","):            # first pattern = base scores; later ones add score keys
+            for f in glob.glob(pat):
+                for r_ in json.load(open(f)):
+                    k_ = (r_["row"], r_["query_index"])
+                    if k_ in SC:
+                        SC[k_]["scores"].update(r_.get("scores", {}))
+                    else:
+                        SC[k_] = r_
 
     def layer_avg(r_, key, layers):
         tot = [0.0] * r_["n_chunks"]
@@ -144,6 +149,8 @@ def main():
             return r_["scores"]["bm25"]
         if name == "att_max[L9-17]":
             return layer_avg(r_, "att_max", range(9, 18))
+        if name == "att_c_max[L9-17]":           # question content words only (template and stop words removed)
+            return layer_avg(r_, "att_c_max", range(9, 18))
         if name == "rrf":                 # reciprocal-rank fusion of bm25 and att_max[L9-17]
             out = [0.0] * r_["n_chunks"]
             for sc in (r_["scores"]["bm25"], layer_avg(r_, "att_max", range(9, 18))):
