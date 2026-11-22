@@ -1,0 +1,7 @@
+# Install the PyTorch build appropriate to your CUDA driver first.
+# CPU correctness tests: Python 3.12, torch 2.11.0; full 4B CUDA training not validated here.
+torch>=2.11,<2.15
+transformers==5.20.2
+datasets==5.1.0
+einops==0.8.2
+pytest>=8,<10

@@ -1,0 +1,2 @@
+# Optional CUDA kernel backend; install after the core requirements and compatible CUDA PyTorch.
+flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@0d42d7ee9ffe88f42f7e2b08d81cd0f5b067f052
