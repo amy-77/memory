@@ -1,0 +1,9 @@
+== 11-20 14:39
+step_240 write last2k 1.1158 beyond2k 1.1217 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3482 beyond2k 1.3474
+== 11-21 15:56
+step_240 write last2k 1.1158 beyond2k 1.1217 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3482 beyond2k 1.3474
+step_480 write last2k 1.0693 beyond2k 1.0790 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3353 beyond2k 1.3299
+step_720 write last2k 1.0285 beyond2k 1.0393 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3178 beyond2k 1.3113
+step_960 write last2k 1.0196 beyond2k 1.0335 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3279 beyond2k 1.3200
+step_1200 write last2k 1.0126 beyond2k 1.0279 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3183 beyond2k 1.3156
+step_1440 write last2k 1.0073 beyond2k 1.0227 | nowrite last2k 1.3811 beyond2k 1.3868 | reset last2k 1.3811 beyond2k 1.3868 | wrong last2k 1.3237 beyond2k 1.3168
