@@ -114,6 +114,11 @@ def main():
         "the history, reused for every turn; 'prefix' = the question is put in front of every turn",
     )
     p.add_argument("--turn-k", type=int, default=4, help="turn_* modes: number of turns written")
+    p.add_argument("--bank-score", default="lr", choices=["lr", "relevance"], help="turn_* + --replay pseudo with bank probes: "
+                   "which keys of a written turn enter the bank: 'lr' = learned write rate (question-agnostic), 'relevance' = "
+                   "the question's per-token score (attention for turn_attn / turn_oracle / turn_random, layer q.k for turn_qk)")
+    p.add_argument("--probe-ctx", action="store_true", help="--replay pseudo: question probes = its read vectors in context "
+                   "(from a first pass with every turn written) instead of the question alone")
     p.add_argument("--turn-layer", type=int, default=19, help="turn_qk: layer whose keys are scored")
     p.add_argument("--oracle-high", type=float, default=10.0, help="--select oracle: weight on the fact sentence")
     p.add_argument("--oracle-low", type=float, default=0.1, help="--select oracle: weight elsewhere in that turn")
@@ -227,7 +232,14 @@ def main():
         if turn_mode:
             spans = enc.turn_spans
             assert list(batch.segments[: len(spans)]) == [tuple(x) for x in spans], "one written segment per turn expected"
-            dbg = None
+            dbg, span_all, nq_max = None, None, max(len(r["q_ids"]) for r in batch.rows)
+            if args.probe_ctx and turn_mode != "turn_qk":
+                ctx.set_segments(batch.segments, batch.update_flags)
+                ctx.query_mask, ctx.query_span, ctx.query_q = None, None, {}
+                ctx.capture_span, ctx.span_q = (n_hist, n_hist + nq_max), {}
+                with torch.no_grad(), autocast(args):
+                    model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
+                span_all, ctx.capture_span, ctx.span_q = ctx.span_q, None, {}
             if turn_mode == "turn_qk":
                 nq = max(len(r["q_ids"]) for r in batch.rows)
                 qb = torch.full((len(batch.rows), nq), tok.pad_token_id, dtype=torch.long)
@@ -243,13 +255,23 @@ def main():
                 ctx.set_segments(batch.segments, batch.update_flags)
                 ctx.query_mask, ctx.query_span, ctx.debug_scores = qm, None, {}
                 ctx.debug_tailpos = torch.tensor([n_hist + len(r["q_ids"]) - 1 for r in batch.rows])
+                if args.probe_ctx:
+                    ctx.capture_span, ctx.span_q = (n_hist, n_hist + nq_max), {}
                 with torch.no_grad(), autocast(args):
                     model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
+                if args.probe_ctx:
+                    span_all, ctx.capture_span, ctx.span_q = ctx.span_q, None, {}
                 dbg, ctx.debug_scores, ctx.debug_tailpos = ctx.debug_scores[(args.turn_layer, "cos_incontext_last1")], None, None
                 ctx.query_q = {}
             results = []
             for i, r in enumerate(batch.rows):
                 ft = queries[i]["fact_turn"]
+                tokrel = torch.zeros(1, batch.input_ids.shape[1])
+                want_attn_tok = args.bank_score == "relevance" and turn_mode != "turn_qk"
+                if turn_mode == "turn_qk" and args.bank_score == "relevance":
+                    tokrel[0, :n_hist] = dbg[i, :n_hist].float()
+                if want_attn_tok and base is None:
+                    raise SystemExit("--bank-score relevance needs --select turn_attn or turn_qk")
                 if turn_mode == "turn_oracle":
                     sc = [1.0 if j == ft else rng.random() * 0.5 for j in range(len(spans))]
                 elif turn_mode == "turn_random":
@@ -266,11 +288,29 @@ def main():
                         with torch.no_grad():
                             base(input_ids=ids, logits_to_keep=1)
                         sc.append(float(attn_acc["sum"].sum()))
+                        if want_attn_tok:
+                            tokrel[0, s_:e_] = attn_acc["sum"].cpu()
                 top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
                 hit[0] += ft in top; hit[1] += 1
                 flags = [j in top for j in range(len(spans))] + list(batch.update_flags[len(spans):])
                 one = type(batch)(batch.input_ids[i : i + 1], None, batch.segments, flags, [r])
-                results.extend(run(one, n_hist, [fact_tok[i]], [turn_span[i]], [queries[i]], None, None))
+                qm1 = None
+                ctx.bank_scores = tokrel if args.bank_score == "relevance" else None
+                if args.replay == "pseudo" and span_all is not None:
+                    nq_i, hh = len(r["q_ids"]), next(iter(span_all.values())).shape[0] // len(batch.rows)
+                    ctx.query_q = {l: t[i * hh : (i + 1) * hh, :nq_i] for l, t in span_all.items()}
+                    qm1 = torch.ones(1, nq_i, dtype=torch.bool)
+                elif args.replay == "pseudo":
+                    # rehearsal probes = the question's read vectors (question alone, before any history)
+                    qrow = torch.tensor([r["q_ids"]])
+                    qm1 = torch.ones(1, qrow.shape[1], dtype=torch.bool)
+                    ctx.query_q, ctx.capture_query = {}, True
+                    ctx.set_segments([(0, qrow.shape[1])], [False])
+                    with torch.no_grad(), autocast(args):
+                        model(input_ids=qrow.to(args.device), logits_to_keep=1)
+                    ctx.capture_query = False
+                results.extend(run(one, n_hist, [fact_tok[i]], [turn_span[i]], [queries[i]], qm1, None))
+                ctx.query_q, ctx.bank_scores = {}, None
             n_show = n_hist
         elif args.query_source == "prefix":
             # the question is put in front of every turn; one row at a time because rows differ in length

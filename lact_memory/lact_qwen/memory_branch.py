@@ -146,6 +146,12 @@ class MemoryContext:
         # of the tokens it sees in query_q[layer] ([BH, Nq, d]) and write nothing; a later forward scores
         # its segments against them. query_prefix: the question is the first N tokens of every segment.
         self.capture_query: bool = False
+        # capture_span=(s, e): an ordinary forward also stores the read vectors of tokens [s, e) in span_q[layer]
+        # (the question as it is read in context, after the history). bank_scores [B, L]: per-token relevance
+        # used only to choose which keys enter the replay bank (does not change the write itself).
+        self.capture_span: Optional[tuple[int, int]] = None
+        self.span_q: dict[int, torch.Tensor] = {}
+        self.bank_scores: Optional[torch.Tensor] = None
         self.query_q: dict[int, torch.Tensor] = {}
         self.query_prefix: int = 0
         # Diagnostic: set to {} to collect, per layer, the raw query score of every token [B, L]
@@ -397,6 +403,8 @@ class LaCTMemoryBranch(nn.Module):
 
         if ctx.capture_query:
             ctx.query_q[self.layer_idx] = q.detach()
+        if ctx.capture_span is not None and not ctx.capture_query:
+            ctx.span_q[self.layer_idx] = q[:, ctx.capture_span[0] : ctx.capture_span[1]].detach()
             segments, flags = [(0, length)], [False]
 
         if ctx.debug_scores is not None and not ctx.capture_query and self.layer_idx in ctx.query_q:
@@ -450,6 +458,9 @@ class LaCTMemoryBranch(nn.Module):
                 gains = g.repeat_interleave(h, dim=0)
             scores = w.repeat_interleave(h, dim=0)
             lr = lr * scores[..., None].to(lr.dtype)
+
+        if scores is None and ctx.bank_scores is not None and not ctx.capture_query:
+            scores = ctx.bank_scores.to(q.device).float().repeat_interleave(h, dim=0)
 
         weights = self.fast_weights()
         state = ctx.states.get(self.layer_idx) if ctx.session else None
