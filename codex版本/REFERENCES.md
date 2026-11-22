@@ -47,6 +47,9 @@ FLA KDA 的递推是 `S_new = D @ S + beta * k @ (v - k.T @ D @ S).T`。
 ```bash
 python -m pip install -r codex版本/requirements-kda.txt
 export TRITON_F32_DEFAULT=ieee
+# H20 上可选：固定一个原生候选配置，避免 FP32 反向内核的长时间自动调优。
+export FLA_CACHE_MODE=default
+export FLA_CONFIG_DIR="$PWD/codex版本/framework/configs/fla-h20-ieee"
 python codex版本/framework/scripts/check_kda_backend.py --length 2048 --heads 32 --dim 128
 # 在当前 CUDA / PyTorch / FLA 环境验证通过后，给训练命令追加：
 # --mem-matrix-backend fla_kda
@@ -54,10 +57,19 @@ python codex版本/framework/scripts/check_kda_backend.py --length 2048 --heads 
 
 该检查覆盖最终状态及初始状态、key、value、遗忘门的梯度，且跨两个写入调用反传。
 时间是写入算子 forward + backward，不代表整个 Qwen 模型的训练吞吐。
+该 H20 配置只固定一个反向内核的 tile/warp/stage 参数，其余算子照常选择配置；
+这是减少首次编译成本的候选参数，不是最优速度的声明，也不应直接外推到其他 GPU。
 数学等价不保证任意 dtype、长度下误差相同，长序列和完整模型仍需实测。
 H20 上首次检查发现 Triton 默认 TF32 导致状态相对 RMS 误差约 0.00113，超过
 0.001 的验收阈值。因此适配器要求进程启动前显式设置 IEEE 精度，不能仅凭输入
 张量标注为 FP32 就假定乘法按完整 FP32 执行。
+这一环境变量不能覆盖 FLA 显式指定的 TF32 运算。固定版本中的矩阵逆合并仍然
+触发逐元素误差，因此适配器在首次编译前将该版本的
+`SOLVE_TRIL_DOT_PRECISION` 也设置为 IEEE；它影响当前进程内的 KDA 精度策略，
+不修改安装目录或递推公式。使用了 FLA 内部常量，故必须保持依赖固定并在升级时
+重新验证；找不到预期常量会报错。仅设置环境变量不足以通过完整检查。
+本次 H20 的完整 IEEE 检查通过，最大相对 RMS 误差约 `1.1e-6`；不过没有观察到
+提速，故保留 PyTorch 为默认实现。误差、计时条件与限制见 [验证记录](VALIDATION.md)。
 
 ## 高效后训练：保留 MemT 目标，借用数据工程
 

@@ -14,8 +14,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is r
 def test_cuda_kda_state_and_cross_step_gradient():
     pytest.importorskip("fla")
     torch.manual_seed(5)
-    state = torch.randn(2, 128, 128, device="cuda") * .1
-    u = torch.nn.functional.normalize(torch.randn(2, 256, 128, device="cuda"), dim=-1) * .7
+    state = torch.randn(4, 128, 128, device="cuda") * .1
+    u = torch.nn.functional.normalize(torch.randn(4, 256, 128, device="cuda"), dim=-1) * .7
     z = torch.randn_like(u) * .1
     lam = -torch.rand_like(u) * .03
     inputs = [x.requires_grad_() for x in (state, u, z, lam)]
@@ -36,10 +36,10 @@ def test_cuda_model_with_bf16_and_activation_checkpointing():
     from transformers import Qwen3Config, Qwen3ForCausalLM
     torch.manual_seed(5)
     model = Qwen3ForCausalLM(Qwen3Config(vocab_size=97, hidden_size=64,
-        intermediate_size=128, num_hidden_layers=2, num_attention_heads=2,
+        intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=1, head_dim=128, attn_implementation="eager")).to("cuda", torch.bfloat16)
     set_attention_window(model, 128, 0, 128)
-    cfg = MemoryConfig(core="matrix", num_heads=2, head_dim=128, chunk_size=128,
+    cfg = MemoryConfig(core="matrix", num_heads=4, head_dim=128, chunk_size=128,
         write_block=64, qkv_init="attention", qkv_act="none", inject="pre_o_proj",
         out_scale="memt", forget_rank=8, output_gate_rank=8, stable_matrix_gates=True)
     attach_memory(model, cfg)
@@ -63,3 +63,38 @@ def test_cuda_model_with_bf16_and_activation_checkpointing():
     for name in expected_grads:
         # Backbone BF16 arithmetic can amplify tiny kernel differences near rounding boundaries.
         torch.testing.assert_close(actual_grads[name], expected_grads[name], atol=5e-5, rtol=1e-2, msg=name)
+
+
+def test_cuda_default_memory_with_segmented_flex_attention():
+    """Exercise the launcher's attention backend, including padding and checkpointing."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    torch.manual_seed(17)
+    model = Qwen3ForCausalLM(Qwen3Config(vocab_size=97, hidden_size=64,
+        intermediate_size=128, num_hidden_layers=2, num_attention_heads=2,
+        num_key_value_heads=1, head_dim=128, attn_implementation="eager")).to("cuda")
+    set_attention_window(model, 128, 0, 128)
+    attach_memory(model, MemoryConfig(core="matrix", num_heads=2, head_dim=128,
+        chunk_size=128, write_block=64, qkv_init="attention", qkv_act="none",
+        inject="pre_o_proj", out_scale="memt", forget_rank=8, output_gate_rank=8,
+        stable_matrix_gates=True))
+    freeze_base(model)
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()
+    wrapper = MemoryTrainingLoss(model, chunk=32)
+    ids = torch.randint(1, 97, (2, 256), device="cuda")
+    mask = torch.arange(256, device="cuda")[None] < torch.tensor([256, 192], device="cuda")[:, None]
+    ids = ids.masked_fill(~mask, 0)
+    labels = ids.masked_fill(~mask, -100)
+    def evaluate(implementation):
+        model.set_attn_implementation(implementation)
+        model.zero_grad(set_to_none=True)
+        ce, _ = wrapper(ids, labels, attention_mask=mask)
+        ce.backward()
+        return ce.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
+    expected_loss, expected_grads = evaluate("eager")
+    actual_loss, actual_grads = evaluate("flex_attention")
+    torch.testing.assert_close(actual_loss, expected_loss, atol=2e-5, rtol=1e-4)
+    assert actual_grads.keys() == expected_grads.keys()
+    for name in expected_grads:
+        torch.testing.assert_close(actual_grads[name], expected_grads[name], atol=2e-6, rtol=2e-3, msg=name)

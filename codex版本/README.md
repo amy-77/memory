@@ -6,6 +6,7 @@
 
 - [修复与训练说明](TRAINING_FIXES.md)：问题、启动命令、旧 checkpoint 兼容、测试范围。
 - [参考实现与取舍](REFERENCES.md)：MemT、LaCT、FLA/KDA、LiveMem 等工作的适用范围。
+- [验证记录](VALIDATION.md)：CPU 回归、CUDA 数值检查及尚未验证的范围。
 - `framework/scripts/train_memory.py`：冻结 Qwen3、训练记忆分支的 CPT / 回答位置 KL 蒸馏。
 - `framework/scripts/cache_teacher.py`：离线缓存完整上下文教师的 Top-K 分布。
 - `framework/scripts/check_kda_backend.py`：可选 CUDA KDA 算子的状态、跨块梯度及性能检查。
@@ -24,6 +25,9 @@ NPROC_PER_NODE=8 bash codex版本/train_run/train_8gpu.sh
 先用 `--stop-at 10` 做 GPU 小规模检查，再决定完整训练预算。
 默认保留原有的 36 层记忆结构，使用 PyTorch 写入实现。
 可选 FLA/KDA 必须先按 [参考说明](REFERENCES.md) 安装并验证，再显式启用。
+H20 的写入数值检查已通过，但本次 FP32 微基准未显示提速，因此仍属实验选项。
+本版已通过 40 项 CPU 测试、3 项 CUDA 测试和独立长序列写入检查；完整 4B 重训
+和下游任务精度尚未验证。
 
 当前修复包括：正确选择完整 checkpoint、真正生效的学习率下限、文档隔离、
 按有效 token 归一化、多卡有限数据结束同步、梯度累积期间减少通信，以及

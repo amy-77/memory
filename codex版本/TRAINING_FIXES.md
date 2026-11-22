@@ -134,10 +134,11 @@ memory gradients with activation checkpointing, masked padding, document
 isolation, numeric checkpoint selection, archive repair, uninterrupted versus
 resumed training, and two CPU/Gloo ranks with uneven finite post-training data
 (including a rank with no remaining examples). All use local tiny Qwen3 models;
-they require no model download. Full 4B, 8-GPU CUDA training, CUDA peak-memory
+they require no model download. Full 4B, 8-GPU training, full-model peak-memory
 measurements, and LoCoMo quality after retraining have not been run in this fix.
-CUDA write-kernel and tiny-model checks are separate from full 4B training; their
-results are recorded separately when available. CPU tests skip these optional checks.
+CUDA write-kernel and tiny-model checks are separate from full 4B training; see
+[VALIDATION.md](VALIDATION.md) for measured results and limitations. CPU tests skip
+these CUDA checks.
 
 ## Reproduction limits
 
