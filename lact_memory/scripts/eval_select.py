@@ -36,7 +36,7 @@ from lact_qwen.synth import read_jsonl, turn_text
 # attn: attention mass of the frozen base model, question placed after each turn; qk: cosine between the read
 # vector at the last question token (taken from a first pass with every turn written) and the keys of layer
 # --turn-layer; oracle: the turn that states the fact scores highest; random: control.
-TURN_MODES = ("turn_attn", "turn_qk", "turn_oracle", "turn_random")
+TURN_MODES = ("turn_attn", "turn_qk", "turn_oracle", "turn_random", "turn_evidence")
 
 
 def encode_with_offsets(dialogue, tokenizer):
@@ -347,7 +347,10 @@ def main():
                     tokrel[0, :n_hist] = dbg[i, :n_hist].float()
                 if want_attn_tok and base is None:
                     raise SystemExit("--bank-score relevance needs --select turn_attn or turn_qk")
-                if turn_mode == "turn_oracle":
+                ev = set(queries[i].get("evidence_turns") or [ft])
+                if turn_mode == "turn_evidence":  # upper bound: write exactly the turns that hold the evidence (labels)
+                    sc = [1.0 if j in ev else 0.0 for j in range(len(spans))]
+                elif turn_mode == "turn_oracle":
                     sc = [1.0 if j == ft else rng.random() * 0.5 for j in range(len(spans))]
                 elif turn_mode == "turn_random":
                     sc = [rng.random() for _ in spans]
@@ -365,10 +368,13 @@ def main():
                         sc.append(float(attn_acc["sum"].sum()))
                         if want_attn_tok:
                             tokrel[0, s_:e_] = attn_acc["sum"].cpu()
-                if args.write_thresh is not None:
+                k_i = len(ev) if args.turn_k < 0 else args.turn_k  # --turn-k -1: as many turns as there are evidence turns
+                if turn_mode == "turn_evidence":
+                    top = set(ev)
+                elif args.write_thresh is not None:
                     top = {j for j in range(len(spans)) if sc[j] >= args.write_thresh}
                 else:
-                    top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
+                    top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[:k_i])
                 written[0] += len(top); written[1] += len(spans)
                 if args.dump_turn_scores:
                     with open(args.dump_turn_scores, "a") as fd:
