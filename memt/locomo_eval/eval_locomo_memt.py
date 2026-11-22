@@ -24,7 +24,7 @@ modes
 Chunk boundaries are counted back from (history + question + 64 reserved tokens), so scoring the gold answer
 and greedy generation (--gen) use the same chunks; the last chunk only reads memory.
 """
-import argparse, json, math, random, sys, time, zlib
+import argparse, glob, json, math, random, sys, time, zlib
 from pathlib import Path
 
 import torch
@@ -88,13 +88,16 @@ def score(logits, seq, a0, a1, offset):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True)
-    p.add_argument("--mode", required=True, choices=["full", "last", "nowrite", "write", "evidence", "random", "qk", "wrong"])
+    p.add_argument("--mode", required=True, choices=["full", "last", "nowrite", "write", "evidence", "random", "qk", "wrong", "scored"])
     p.add_argument("--chunk", type=int, default=2048)
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--nshards", type=int, default=1)
     p.add_argument("--limit", type=int, default=0, help="only the first N rows (smoke test)")
     p.add_argument("--gen", type=int, default=24, help="greedy-decode up to N tokens after the question; 0 = off")
     p.add_argument("--reserve", type=int, default=64, help="tokens kept free at the end of the last chunk")
+    p.add_argument("--scores", default=None, help="mode scored: glob of score_strategies.py outputs")
+    p.add_argument("--strategy", default=None, help="mode scored: bm25 | att_max[L9-17] | rrf | random")
+    p.add_argument("--k", type=int, default=2, help="mode scored: chunks written per question (fixed, label-free)")
     p.add_argument("--replay-k", type=int, default=0,
                    help="Robins-style rehearsal with the question's own memory queries: probes per head; 0 = off")
     p.add_argument("--replay-alpha", type=float, default=1.0, help="rehearsal strength (1 = restore the read-out)")
@@ -121,6 +124,36 @@ def main():
     C = args.chunk
     stop_ids = {i for i in (tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>"),
                             tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int) and i >= 0}
+
+    SC = {}
+    if args.mode == "scored":
+        for f in glob.glob(args.scores):
+            for r_ in json.load(open(f)):
+                SC[(r_["row"], r_["query_index"])] = r_
+
+    def layer_avg(r_, key, layers):
+        tot = [0.0] * r_["n_chunks"]
+        for l in layers:
+            row = r_["scores"][key][l]; z = sum(row) or 1.0
+            for j, x in enumerate(row):
+                tot[j] += x / z
+        return tot
+
+    def strategy_scores(r_, name, ri, qi):
+        if name == "bm25":
+            return r_["scores"]["bm25"]
+        if name == "att_max[L9-17]":
+            return layer_avg(r_, "att_max", range(9, 18))
+        if name == "rrf":                 # reciprocal-rank fusion of bm25 and att_max[L9-17]
+            out = [0.0] * r_["n_chunks"]
+            for sc in (r_["scores"]["bm25"], layer_avg(r_, "att_max", range(9, 18))):
+                for i, j in enumerate(sorted(range(len(sc)), key=lambda j: -sc[j])):
+                    out[j] += 1 / (60 + i)
+            return out
+        if name == "random":
+            rng = random.Random(zlib.crc32(f"{ri}#{qi}#fixedk".encode()))
+            return [rng.random() for _ in range(r_["n_chunks"])]
+        raise ValueError(name)
 
     rows = [json.loads(l) for l in open(args.data)]
     if args.limit:
@@ -175,6 +208,11 @@ def main():
                             flags = set(earlier)
                         elif args.mode == "evidence":
                             flags = set(evid)
+                        elif args.mode == "scored":
+                            r_ = SC[(ri, qi)]
+                            assert r_["n_chunks"] == len(earlier) and r_["evidence"] == sorted(evid), (ri, qi)
+                            sc = strategy_scores(r_, args.strategy, ri, qi) if earlier else []
+                            flags = set(sorted(earlier, key=lambda j: -sc[j])[:args.k])
                         elif args.mode == "qk":
                             CAP.update(on=True, nq=len(qq), mass=None, layers=0)
                             scorer(input_ids=torch.tensor([hist + qq], device=dev), logits_to_keep=1)
@@ -187,7 +225,7 @@ def main():
                             rng = random.Random(zlib.crc32(f"{dlg['id']}#{qi}".encode()))
                             flags = set(rng.sample(earlier, len(evid)))
                         n_written += len(flags); n_chunks += len(earlier)
-                        if args.mode in ("evidence", "random", "qk"):
+                        if args.mode in ("evidence", "random", "qk", "scored"):
                             n_ev += len(evid); n_hit += len(evid & flags)
                         if R_ is not None:
                             # probe queries = the question's own memory queries, taken from a forward of the chunk
@@ -235,7 +273,7 @@ def main():
                          "distance_tokens": len(hist) - spans[ft][1], "fact_turn": ft, "num_turns": len(spans),
                          "exact": ex, "logprob": lpv, "seq_len": L, "question": q["question"].strip(),
                          "answer": q["answer"], "pred": pred,
-                         "evidence_chunks": len(evid), "evidence_chunks_written": None if args.mode in ("full", "last") else len(evid & flags) if args.mode in ("evidence", "random", "qk") else None})
+                         "evidence_chunks": len(evid), "evidence_chunks_written": None if args.mode in ("full", "last") else len(evid & flags) if args.mode in ("evidence", "random", "qk", "scored") else None})
         if len(recs) and ri % 20 == args.shard:
             print(f"row {ri+1}/{len(rows)} questions {len(recs)} {time.time()-t0:.0f}s", flush=True)
     summ = {"written_chunks": n_written, "earlier_chunks": n_chunks, "evidence_chunks": n_ev, "evidence_chunks_written": n_hit}
