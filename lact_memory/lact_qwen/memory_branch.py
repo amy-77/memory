@@ -406,6 +406,9 @@ class LaCTMemoryBranch(nn.Module):
 
         if ctx.capture_query:
             ctx.query_q[self.layer_idx] = q.detach()
+        kp = getattr(ctx, "capture_key_pos", None)  # positions whose keys are stored per layer (key-identity diagnostic)
+        if kp is not None and not ctx.capture_query:
+            ctx.key_store[self.layer_idx] = k[:, kp.to(k.device)].detach().float().cpu()
         if ctx.capture_span is not None and not ctx.capture_query:
             ctx.span_q[self.layer_idx] = q[:, ctx.capture_span[0] : ctx.capture_span[1]].detach()
             segments, flags = [(0, length)], [False]

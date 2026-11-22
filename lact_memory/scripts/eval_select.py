@@ -126,6 +126,16 @@ def main():
                    "(from a first pass with every turn written) instead of the question alone")
     p.add_argument("--qk-tokens", default="last1", choices=["last1", "all", "mean"], help="turn_qk: question tokens whose in-context "
                    "read vectors score the keys: the last one, the best-matching of all, or the mean over all")
+    p.add_argument("--qk-source", default="full", choices=["full", "turn"], help="where the question read vectors for q.k come from: "
+                   "'full' = one pass over the WHOLE dialogue with every turn written, question after it (offline: uses later turns); "
+                   "'turn' = streaming: the question is appended to each turn on its own, memory empty, nothing written; "
+                   "the turn's keys are scored by the question tokens read right after that turn")
+    p.add_argument("--write-thresh", type=float, default=None, help="turn_* modes, STREAMING decision: write a turn iff its own score "
+                   ">= this threshold (decided when the turn arrives, no ranking against later turns); replaces --turn-k. "
+                   "Calibrate on a dev set with --dump-turn-scores")
+    p.add_argument("--dump-turn-scores", default=None, help="append one json line per question: turn scores and the fact turn")
+    p.add_argument("--delta-erase", type=float, default=0.0, help="erase-then-write at inference: target = v - a * (current "
+                   "read-out at k); 0 = the trained LaCT rule")
     p.add_argument("--key-select", default="off", choices=["off", "layer", "random"], help="turn_* modes: inside every written turn, "
                    "each layer writes only its own --key-frac best keys, scored with ITS OWN in-context question read vectors "
                    "(--qk-tokens); 'random' = the same share of random tokens per layer (control)")
@@ -160,6 +170,10 @@ def main():
     extra = {k: v for k, v in extra.items() if v is not None}
     if extra and ctx is not None:
         set_replay(model, **extra)
+    if args.delta_erase:
+        for mod in model.modules():
+            if hasattr(mod, "update_cfg"):
+                mod.update_cfg.delta_erase = args.delta_erase
     lexical = args.select == "lexical"
     turn_mode = args.select if args.select in TURN_MODES else None
     if turn_mode:
@@ -184,6 +198,7 @@ def main():
     rng = _random.Random(0)
     hit = [0, 0]
     layer_stat = [0, 0, 0]
+    written = [0, 0]  # turns written / turns seen (turn_* modes)
     key_stat = [0.0, 0]  # per-layer key selection: share of the fact sentence's tokens a layer keeps (mean over layers and rows)
     key_gen = torch.Generator().manual_seed(0)
     n_layers = len(model.model.layers) if hasattr(model, "model") else 0  # per-layer selection: layers that selected, of those how many kept the fact turn, layers in total
@@ -264,7 +279,37 @@ def main():
                     model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
                 span_all, ctx.capture_span, ctx.span_q = ctx.span_q, None, {}
             dbg_all = {}
-            if turn_mode == "turn_qk" or args.key_select == "layer" or args.bank_score == "layer_qk":
+            need_qk = turn_mode == "turn_qk" or args.key_select == "layer" or args.bank_score == "layer_qk"
+            if need_qk and args.qk_source == "turn":
+                # streaming q.k: for every turn, [turn + question] alone (no history, no writes); one forward per turn,
+                # batched over the questions (right-padded, so the turn's tokens do not see the padding)
+                nq_max, nrows, total = max(len(r["q_ids"]) for r in batch.rows), len(batch.rows), batch.input_ids.shape[1]
+                for (s_, e_) in spans:
+                    nt = e_ - s_
+                    xb = torch.full((nrows, nt + nq_max), tok.pad_token_id, dtype=torch.long)
+                    qv = torch.zeros(nrows, nq_max, dtype=torch.bool)
+                    for ii, r in enumerate(batch.rows):
+                        xb[ii, :nt] = torch.tensor(enc.history_ids[s_:e_]); xb[ii, nt : nt + len(r["q_ids"])] = torch.tensor(r["q_ids"])
+                        qv[ii, : len(r["q_ids"])] = True
+                    ctx.set_segments([(0, nt), (nt, nt + nq_max)], [False, False])
+                    ctx.capture_span, ctx.span_q = (nt, nt + nq_max), {}
+                    ctx.capture_key_pos, ctx.key_store = torch.arange(nt), {}
+                    with torch.no_grad(), autocast(args):
+                        model(input_ids=xb.to(args.device), logits_to_keep=1)
+                    hh = None
+                    for l, qq in ctx.span_q.items():
+                        kk = ctx.key_store[l]
+                        hh = qq.shape[0] // nrows
+                        qn = F.normalize(qq.float().cpu(), dim=-1).view(nrows, hh, nq_max, -1)
+                        kn = F.normalize(kk.float(), dim=-1).view(nrows, hh, nt, -1)
+                        simm = torch.einsum("bhtd,bhqd->bhtq", kn, qn).masked_fill(~qv[:, None, None, :], float("-inf"))
+                        sc_l = simm.amax(dim=-1).mean(dim=1)  # [nrows, nt]
+                        if l not in dbg_all:
+                            dbg_all[l] = torch.zeros(nrows, total)
+                        dbg_all[l][:, s_:e_] = sc_l
+                    ctx.capture_span, ctx.span_q, ctx.capture_key_pos, ctx.key_store = None, {}, None, {}
+                dbg = dbg_all.get(args.turn_layer)
+            elif need_qk:
                 nq = max(len(r["q_ids"]) for r in batch.rows)
                 qb = torch.full((len(batch.rows), nq), tok.pad_token_id, dtype=torch.long)
                 qm = torch.zeros(len(batch.rows), nq, dtype=torch.bool)
@@ -320,7 +365,15 @@ def main():
                         sc.append(float(attn_acc["sum"].sum()))
                         if want_attn_tok:
                             tokrel[0, s_:e_] = attn_acc["sum"].cpu()
-                top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
+                if args.write_thresh is not None:
+                    top = {j for j in range(len(spans)) if sc[j] >= args.write_thresh}
+                else:
+                    top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
+                written[0] += len(top); written[1] += len(spans)
+                if args.dump_turn_scores:
+                    with open(args.dump_turn_scores, "a") as fd:
+                        fd.write(json.dumps({"dialogue": dlg["id"], "query_index": r["query_index"], "category": queries[i]["category"],
+                                             "fact_turn": ft, "scores": sc}) + "\n")
                 flags = [j in top for j in range(len(spans))] + list(batch.update_flags[len(spans):])
                 ctx.layer_update_flags = None
                 if turn_mode == "turn_qk" and args.per_layer != "off":
@@ -484,7 +537,8 @@ def main():
         summary[f"{cat}/{bucket}"] = e
 
     if turn_mode:
-        print(f"\nturn selection {turn_mode} k={args.turn_k} layer={args.turn_layer}: fact turn written in {hit[0]}/{hit[1]} rows")
+        print(f"\nturn selection {turn_mode} k={args.turn_k} thresh={args.write_thresh} layer={args.turn_layer}: fact turn written in {hit[0]}/{hit[1]} rows; "
+              f"turns written {written[0] / max(written[1], 1):.3f} of all turns")
         if key_stat[1]:
             print(f"key selection {args.key_select} frac={args.key_frac} pool={args.key_pool}: a layer keeps {key_stat[0] / key_stat[1]:.2f} "
                   f"of the fact sentence's tokens (random would keep about {args.key_frac:.2f})")

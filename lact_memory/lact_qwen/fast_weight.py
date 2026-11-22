@@ -148,6 +148,10 @@ class UpdateConfig:
     # "pre":  add the write to an un-normalised running sum and read through its
     #         row-normalised copy, so earlier writes keep their relative size.
     norm: str = "post"
+    # Erase-then-write (inference experiment): the write target becomes v - delta_erase * (what the memory already
+    # returns for k), i.e. f_W(k) - f_W0(k). With 0 this is the LaCT rule (additive); with 1 the step moves the
+    # read-out at k towards v instead of adding v to what is there, like the delta rule of linear memories.
+    delta_erase: float = 0.0
 
 
 def fw_update(
@@ -230,6 +234,7 @@ def segmented_lact(
     """
     outputs = []
     replay = state.replay
+    init_w = tuple(w.detach() for w in state.weights()) if cfg.delta_erase else None
     if replay is not None and getattr(replay, "init_weights", 0) is None:
         replay.init_weights = tuple(w.detach() for w in state.weights())
     for i, ((s, e), do_update) in enumerate(zip(segments, update_flags)):
@@ -245,6 +250,10 @@ def segmented_lact(
         lrs = lr[:, s:e]
         mom = None if momentum is None else momentum[:, s:e].mean(dim=1, keepdim=True)
 
+        if cfg.delta_erase:
+            with torch.no_grad():
+                stored = fw_apply(*state.weights(), ks) - fw_apply(*init_w, ks)
+            vs = vs - cfg.delta_erase * stored.to(vs.dtype)
         if replay is not None:
             ks_w, vs_w, lrs_w = replay.augment_write(ks, vs, lrs, state)
         else:
