@@ -31,6 +31,12 @@ from lact_qwen.modeling import set_replay
 from lact_qwen.select import SELECT_MODES, SelectConfig, lexical_weights, rarity
 from lact_qwen.synth import read_jsonl, turn_text
 
+# Turn-level hard selection: only the --turn-k best-scored turns are written (the others are skipped entirely).
+# attn: attention mass of the frozen base model, question placed after each turn; qk: cosine between the read
+# vector at the last question token (taken from a first pass with every turn written) and the keys of layer
+# --turn-layer; oracle: the turn that states the fact scores highest; random: control.
+TURN_MODES = ("turn_attn", "turn_qk", "turn_oracle", "turn_random")
+
 
 def encode_with_offsets(dialogue, tokenizer):
     """Token ids, turn spans, and for every turn the character offsets of its tokens."""
@@ -77,7 +83,7 @@ def main():
     p.add_argument("--max-segment", type=int, default=4096)
     p.add_argument("--min-write-tokens", type=int, default=0)
     p.add_argument("--out", default=None)
-    p.add_argument("--select", default="none", choices=SELECT_MODES + ("lexical",),
+    p.add_argument("--select", default="none", choices=SELECT_MODES + ("lexical",) + TURN_MODES,
                    help="'lexical': boost history tokens that equal a rare token of the question (and the tokens after them); "
                    "computed once from token ids, the same weights are used in every layer")
     p.add_argument("--boost", type=float, default=10.0, help="--select lexical: weight on a full hit")
@@ -107,6 +113,8 @@ def main():
         "(reference: it has seen the end of the history); 'alone' = a forward of the question by itself before "
         "the history, reused for every turn; 'prefix' = the question is put in front of every turn",
     )
+    p.add_argument("--turn-k", type=int, default=4, help="turn_* modes: number of turns written")
+    p.add_argument("--turn-layer", type=int, default=19, help="turn_qk: layer whose keys are scored")
     p.add_argument("--oracle-high", type=float, default=10.0, help="--select oracle: weight on the fact sentence")
     p.add_argument("--oracle-low", type=float, default=0.1, help="--select oracle: weight elsewhere in that turn")
     p.add_argument("--replay-keep", type=int, default=None, help="scored_kv: pairs kept per written segment")
@@ -129,6 +137,28 @@ def main():
     if extra and ctx is not None:
         set_replay(model, **extra)
     lexical = args.select == "lexical"
+    turn_mode = args.select if args.select in TURN_MODES else None
+    if turn_mode:
+        args.select = "none"
+    base, attn_acc, attn_sel = None, {}, {}
+    if turn_mode == "turn_attn":
+        from transformers import AutoModelForCausalLM
+        base = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, attn_implementation="eager").eval().to(args.device)
+        n_base = len(base.model.layers)
+
+        def _hook(li):
+            def f(mod, inp, out):
+                if out[1] is None or li < n_base // 3:
+                    return
+                a = out[1][0].float()[:, attn_sel["q"]][:, :, attn_sel["k"]].mean(dim=(0, 1))
+                attn_acc["sum"] = attn_acc.get("sum", 0) + a
+            return f
+
+        for li, layer in enumerate(base.model.layers):
+            layer.self_attn.register_forward_hook(_hook(li))
+    import random as _random
+    rng = _random.Random(0)
+    hit = [0, 0]
     corpus_counts = None
     if lexical and args.idf != "history":
         corpus_counts = torch.zeros(len(tok), dtype=torch.float32)
@@ -194,7 +224,55 @@ def main():
         if ctx is not None:
             ctx.query_q, ctx.query_prefix, ctx.capture_query = {}, 0, False
 
-        if args.query_source == "prefix":
+        if turn_mode:
+            spans = enc.turn_spans
+            assert list(batch.segments[: len(spans)]) == [tuple(x) for x in spans], "one written segment per turn expected"
+            dbg = None
+            if turn_mode == "turn_qk":
+                nq = max(len(r["q_ids"]) for r in batch.rows)
+                qb = torch.full((len(batch.rows), nq), tok.pad_token_id, dtype=torch.long)
+                qm = torch.zeros(len(batch.rows), nq, dtype=torch.bool)
+                for i, r in enumerate(batch.rows):
+                    qb[i, : len(r["q_ids"])] = torch.tensor(r["q_ids"]); qm[i, : len(r["q_ids"])] = True
+                ctx.capture_query = True
+                ctx.set_segments([(0, nq)], [False])
+                with torch.no_grad(), autocast(args):
+                    model(input_ids=qb.to(args.device), logits_to_keep=1)
+                ctx.capture_query = False
+                # first pass, every turn written: the read vector the model uses at the last question token
+                ctx.set_segments(batch.segments, batch.update_flags)
+                ctx.query_mask, ctx.query_span, ctx.debug_scores = qm, None, {}
+                ctx.debug_tailpos = torch.tensor([n_hist + len(r["q_ids"]) - 1 for r in batch.rows])
+                with torch.no_grad(), autocast(args):
+                    model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
+                dbg, ctx.debug_scores, ctx.debug_tailpos = ctx.debug_scores[(args.turn_layer, "cos_incontext_last1")], None, None
+                ctx.query_q = {}
+            results = []
+            for i, r in enumerate(batch.rows):
+                ft = queries[i]["fact_turn"]
+                if turn_mode == "turn_oracle":
+                    sc = [1.0 if j == ft else rng.random() * 0.5 for j in range(len(spans))]
+                elif turn_mode == "turn_random":
+                    sc = [rng.random() for _ in spans]
+                elif turn_mode == "turn_qk":
+                    sc = [float(dbg[i, s_:e_].float().topk(min(5, e_ - s_)).values.mean()) for s_, e_ in spans]
+                else:
+                    sc = []
+                    for s_, e_ in spans:
+                        ids = torch.tensor([enc.history_ids[s_:e_] + r["q_ids"]]).to(args.device)
+                        attn_sel["k"] = torch.arange(0, e_ - s_, device=args.device)
+                        attn_sel["q"] = torch.arange(e_ - s_, ids.shape[1], device=args.device)
+                        attn_acc.clear()
+                        with torch.no_grad():
+                            base(input_ids=ids, logits_to_keep=1)
+                        sc.append(float(attn_acc["sum"].sum()))
+                top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
+                hit[0] += ft in top; hit[1] += 1
+                flags = [j in top for j in range(len(spans))] + list(batch.update_flags[len(spans):])
+                one = type(batch)(batch.input_ids[i : i + 1], None, batch.segments, flags, [r])
+                results.extend(run(one, n_hist, [fact_tok[i]], [turn_span[i]], [queries[i]], None, None))
+            n_show = n_hist
+        elif args.query_source == "prefix":
             # the question is put in front of every turn; one row at a time because rows differ in length
             results = []
             for i, r in enumerate(batch.rows):
@@ -294,6 +372,9 @@ def main():
             e["prefers_old_rate"] = sum(olds) / len(olds)
         summary[f"{cat}/{bucket}"] = e
 
+    if turn_mode:
+        print(f"\nturn selection {turn_mode} k={args.turn_k} layer={args.turn_layer}: fact turn written in {hit[0]}/{hit[1]} rows")
+        args.select = turn_mode
     print(f"\nselect={args.select} boost={args.boost} idf={os.path.basename(args.idf)} source={args.query_source} tau={args.tau} cap={args.cap} seg_gain={args.seg_gain} "
           f"keep={args.keep} pool={args.pool}/{args.pool_mode} qlast={args.query_last} topk={args.topk_frac} replay={args.replay or 'from-config'} probes={args.probe_src} target={args.pseudo_target} "
           f"rkeep={args.replay_keep} samples={args.replay_samples} lr_scale={args.replay_lr_scale}")

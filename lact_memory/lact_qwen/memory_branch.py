@@ -399,14 +399,39 @@ class LaCTMemoryBranch(nn.Module):
             ctx.query_q[self.layer_idx] = q.detach()
             segments, flags = [(0, length)], [False]
 
-        if ctx.debug_scores is not None and not ctx.capture_query and self.layer_idx in ctx.query_q and self.layer_idx <= getattr(ctx, 'debug_max_layer', 99):
-            from .select import last_tokens, query_scores
+        if ctx.debug_scores is not None and not ctx.capture_query and self.layer_idx in ctx.query_q:
+            # Audit of "can the question find the keys that hold its answer": several similarities between the
+            # question's read vectors and every token's key, each [B, L] (see scripts/audit_scores.py).
+            from .select import last_tokens
 
-            for name, n_last in (("all", 0), ("last1", 1), ("last2", 2), ("last4", 4)):
-                qm = last_tokens(ctx.query_mask.to(q.device), n_last)
-                ctx.debug_scores[(self.layer_idx, name)] = query_scores(
-                    k, ctx.query_q[self.layer_idx].to(q.device), qm, b, h, 0.1 if n_last == 0 else 1.0
-                ).cpu()
+            qa = ctx.query_q[self.layer_idx].to(q.device).float()  # question alone [BH, Nq, d]
+            qm = ctx.query_mask.to(q.device)
+            w0, _, w2 = self.fast_weights()
+            w0, w2 = w0.float(), w2.float()
+
+            def phi(x):  # the feature map through which a LaCT write to w1 is later read: f(x) = w1 (silu(w0 x) * (w2 x))
+                xb = x.view(b, h, x.shape[1], d)
+                g = F.silu(torch.einsum("bhld,hed->bhle", xb, w0)) * torch.einsum("bhld,hed->bhle", xb, w2)
+                return F.normalize(g, dim=-1).reshape(b * h, x.shape[1], -1)
+
+            def sim(kk, qq, mask):  # best-matching question token, mean over heads -> [B, L]
+                sgl = kk @ qq.transpose(1, 2)
+                sgl = sgl.masked_fill(~mask.repeat_interleave(h, dim=0)[:, None, :], float("-inf"))
+                return sgl.amax(dim=-1).view(b, h, -1).mean(dim=1).cpu()
+
+            kf, pk = k.float(), None
+            for name, n_last in (("alone_all", 0), ("alone_last1", 1)):
+                m = last_tokens(qm, n_last)
+                ctx.debug_scores[(self.layer_idx, "cos_" + name)] = sim(kf, qa, m)
+                pk = phi(kf) if pk is None else pk
+                ctx.debug_scores[(self.layer_idx, "kernel_" + name)] = sim(pk, phi(qa), m)
+            tail = getattr(ctx, "debug_tailpos", None)  # [B] position of the last question token in THIS forward
+            if tail is not None:
+                idx = tail.to(q.device).repeat_interleave(h)[:, None, None].expand(-1, 1, d)
+                qt = torch.gather(q.float(), 1, idx)  # the read vector actually used for the first answer token
+                one = torch.ones(b, 1, dtype=torch.bool, device=q.device)
+                ctx.debug_scores[(self.layer_idx, "cos_incontext_last1")] = sim(kf, qt, one)
+                ctx.debug_scores[(self.layer_idx, "kernel_incontext_last1")] = sim(pk, phi(qt), one)
 
         scores = gains = None
         sel = ctx.select

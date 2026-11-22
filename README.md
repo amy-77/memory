@@ -15,3 +15,9 @@ Selective writing and replay for fixed-size external memories attached to a froz
   - run scripts used on our servers (paths inside them are machine-specific).
 
 Status: research code in progress; results in `docs/` are preliminary.
+
+## Update 2026-11-22
+
+- `docs/LACT_SELECTIVE_WRITE.md`: turn-level selective writing on the LaCT memory (results, the two scores, commands, how to run on another checkpoint).
+- `lact_memory/scripts/audit_scores.py`, `--select turn_attn|turn_qk|turn_oracle|turn_random` in `lact_memory/scripts/eval_select.py`.
+- `livemem_patch/`: `score_attn.py` (attention relevance of every session), `attn:K:A` mask policy (`patch_masks.py`), reference runs (`eval_trunc.sh`), evidence-position breakdown (`bucket.py`), needle test (`needle_*.py/sh`).
