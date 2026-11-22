@@ -1,8 +1,8 @@
 """One-pass, response-only post-training on frozen-teacher trajectories.
 
 Rows contain history_ids, query_ids, response_ids, id, teacher_generated=True.
-History must end at a storage-step boundary. The complete query/response fits
-one current step. No padding is inserted into the memory or attention stream.
+History is cut into storage steps of `segment` tokens (the last one may be short). The complete
+query/response fits one current step; attention follows these steps (set_attention_segments). No padding is inserted into the memory or attention stream.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ def encode_post_row(row: dict, segment: int, max_length: int) -> dict:
     history, query, response = (row[k] for k in ("history_ids", "query_ids", "response_ids"))
     if row.get("teacher_generated") is not True:
         raise ValueError("post-training requires a recorded frozen-teacher response")
-    if not history or len(history) % segment:
-        raise ValueError("history must contain complete storage steps")
+    if not history:
+        raise ValueError("empty history")
     if not query or not response or len(query) + len(response) > segment:
         raise ValueError("query and response must fit one nonempty current segment")
     ids = history + query + response
@@ -23,13 +23,15 @@ def encode_post_row(row: dict, segment: int, max_length: int) -> dict:
         raise ValueError("trajectory exceeds max_length; silent truncation is not allowed")
     if any(type(i) is not int or i < 0 for i in ids):
         raise ValueError("token IDs must be nonnegative integers")
-    segments = [(a, a + segment) for a in range(0, len(history), segment)]
+    # the last history step may be short (MemT Sec. 3.4); the query + response is a step of its own
+    segments = [(a, min(a + segment, len(history))) for a in range(0, len(history), segment)]
     segments.append((len(history), len(ids)))
     # Position immediately before the first answer token predicts that answer.
     labels = [-100] * (len(history) + len(query)) + response
     return {
         "input_ids": torch.tensor([ids]), "labels": torch.tensor([labels]),
         "segments": segments, "update_flags": [True] * (len(segments) - 1) + [False],
+        "attention_segments": True,
     }
 
 

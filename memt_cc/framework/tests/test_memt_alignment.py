@@ -36,6 +36,8 @@ def test_post_row_masks_history_query_and_keeps_storage_differentiable():
     assert b["labels"][0, 18:].tolist() == [22, 23]
     assert b["segments"] == [(0, 8), (8, 16), (16, 20)]
     assert b["update_flags"] == [True, True, False]
+    short = encode_post_row(dict(row, history_ids=list(range(13))), 8, 32)
+    assert short["segments"] == [(0, 8), (8, 13), (13, 17)] and short["update_flags"] == [True, True, False]
     bad = dict(row, query_ids=list(range(8)))
     with pytest.raises(ValueError):
         encode_post_row(bad, 8, 32)

@@ -43,7 +43,7 @@ from lact_qwen.train_loss import StudentWithLoss
 from lact_qwen.token_store import TokenStore
 from lact_qwen.memory_branch import LaCTMemoryBranch
 from lact_qwen.loading import add_model_args, autocast, load_model, load_teacher, load_tokenizer
-from lact_qwen.modeling import CONFIG_NAME, freeze_base, load_memory_weights, memory_parameters, save_memory
+from lact_qwen.modeling import CONFIG_NAME, freeze_base, load_memory_weights, memory_parameters, save_memory, set_attention_segments
 
 OPTIMIZER_NAME = "optimizer.pt"
 from lact_qwen.synth import read_jsonl
@@ -369,6 +369,10 @@ def main():
                 ctx.clear_segments()
             else:
                 ctx.set_segments(b["segments"], b["update_flags"])
+            segs = b["segments"] if b.get("attention_segments") else None
+            set_attention_segments(core, segs)
+            if teacher is not None:
+                set_attention_segments(teacher, None)
             x = b["input_ids"].to(args.device)
             y = b["labels"].to(args.device)
             if args.batch_audit_dir and step == start:

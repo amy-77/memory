@@ -49,10 +49,22 @@ cd framework && python -m pytest -q tests
 - **LaCT / flame**:数据预分片、fused 损失、整段反传不截断,都借鉴了;LaCT 的优化器配方(lr 1e-3、eps 1e-15)是原训练用的,这里换成了 MemT 报告的。
 - **flash-linear-attention 的 `chunk_gated_delta_rule`**:没有直接用。它的 β 是每头每 token 一个标量、衰减是每头一个标量,而 MemT 的擦除门、遗忘门都按通道;按通道衰减只在内核层有一个未公开的 `gk` 参数。`matrix_memory.py: delta_write` 是同一种分块求解(三角方程),纯 PyTorch。
 - **LiveMem**:它的训练是对数据集标准答案算交叉熵,没有教师蒸馏,所以"后训练蒸馏"不能照搬;能借的是它的公开数据清单和切块方式(MuSiQue、2Wiki、NarrativeQA、QASPER、LongAlign、LongAlpaca、LongMIT 等)以及 64K 打包、`no_sync`。
-- **MemT 第二阶段**(历史 + 问题 + 教师回答,只用 KL,Top-64):入口沿用原有的 `--data post:`,分块损失已支持 Top-K 蒸馏;**教师回答的数据生成脚本还没有写**,这是和报告差距最大的一块。
+- **MemT 第二阶段**(历史 + 问题 + 教师回答,只用 KL,Top-64):`scripts/make_post_data.py` 让冻结底座用完整上下文贪心回答,生成 `post:` 数据;分块损失支持 Top-K 蒸馏。输入是 `{"id", "context", "question"}` 的 jsonl,公开长文问答集转成这个格式即可。
+
+## 第二阶段用法
+
+```bash
+python framework/scripts/make_post_data.py --model /path/Qwen3-4B --input qa.jsonl --out post.jsonl
+python framework/scripts/train_memory.py --model /path/Qwen3-4B --data post:post.jsonl --seq-len 34000 \
+    --memory <第一阶段检查点> --window 2048 --sinks 0 --attn-segment 2048 --attn-impl flex_attention \
+    --ce-weight 0 --distill-weight 1 --distill-top-k 64 --lr 1e-4 --lr-schedule wsd --warmup 500 \
+    --decay-steps 1000 --min-lr-ratio 0.05 --adam-betas 0.9 0.999 --adam-eps 1e-8 --weight-decay 0.01 \
+    --grad-ckpt --steps <N> --out <dir>
+```
+
+历史按 2048 切成写入步,最后一步可以不满;问题 + 回答单独成一步,注意力只看这一步(`set_attention_segments`,sdpa 和 flex 两条路径都实测过:改动历史末尾对问题步的输出影响为 0)。
 
 ## 已知未做
 
-- 第二阶段的数据构造。
-- `post:` 数据仍要求历史长度是 2048 的整数倍。
+- 第二阶段还没有实际跑过:没有把公开问答集转成输入格式,也没有生成过教师回答。
 - 多卡下的 `tok/s` 日志按"各卡 token 数相同"估算,文档模式下是近似值。

@@ -112,3 +112,24 @@ def test_token_store_ranks_are_disjoint_and_resume_is_exact(tmp_path):
     assert a == [tuple(store.tokens[s:e].tolist()) for s, e in windows[order[0::2]]]
     assert b == [tuple(store.tokens[s:e].tolist()) for s, e in windows[order[1::2]]]
     assert take(0, 3, 6) == take(0, 0, 9)[3:]  # resume across the epoch boundary
+
+
+def test_explicit_attention_steps_isolate_a_query_after_a_short_history_step():
+    from lact_qwen import set_attention_segments
+
+    torch.manual_seed(4)
+    base = tiny_qwen3()
+    set_attention_window(base, 8, 0, 8)
+    ids = torch.randint(0, 97, (1, 19))  # history 13 = 8 + 5, then a 6-token query step
+    changed = ids.clone()
+    changed[:, 8:13] = (changed[:, 8:13] + 7) % 97
+    with torch.no_grad():
+        grid = (base(ids).logits[:, 13:16] - base(changed).logits[:, 13:16]).abs().max()
+        set_attention_segments(base, [(0, 8), (8, 13), (13, 19)])
+        steps = (base(ids).logits[:, 13:] - base(changed).logits[:, 13:]).abs().max()
+        inside = (base(ids).logits[:, 8:13] - base(changed).logits[:, 8:13]).abs().max()
+        set_attention_segments(base, None)
+        back = (base(ids).logits[:, 13:16] - base(changed).logits[:, 13:16]).abs().max()
+    assert grid > 1e-3  # on the fixed grid the query shares a block with the history tail
+    assert steps < 1e-6 and inside > 1e-3  # with explicit steps it does not
+    torch.testing.assert_close(back, grid)

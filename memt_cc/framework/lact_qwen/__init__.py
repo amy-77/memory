@@ -7,6 +7,7 @@ from .modeling import (
     load_memory_weights,
     memory_parameters,
     save_memory,
+    set_attention_segments,
     set_attention_window,
     set_replay,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "memory_parameters",
     "save_memory",
     "segmented_lact",
+    "set_attention_segments",
     "set_attention_window",
     "set_replay",
 ]

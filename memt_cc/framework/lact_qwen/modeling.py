@@ -40,11 +40,35 @@ def _sink_overlay(num_sinks: int):
     return inner_mask
 
 
-def _segment_overlay(segment: int, num_sinks: int):
+def _segment_overlay(segment: int, num_sinks: int, config=None):
     def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
-        return (q_idx // segment == kv_idx // segment) | (kv_idx < num_sinks)
+        ids = getattr(config, "attention_segment_ids", None)
+        if ids is not None:
+            # explicit steps (set_attention_segments): a token sees only tokens of its own step
+            same = ids[q_idx] == ids[kv_idx]
+        else:
+            same = q_idx // segment == kv_idx // segment
+        return same | (kv_idx < num_sinks)
 
     return inner_mask
+
+
+def set_attention_segments(model: nn.Module, segments=None):
+    """Attention steps for the next forward(s): a list of (start, end) covering the sequence, or None for
+    the fixed grid of config.attention_segment tokens. Needed when steps are not all the same length,
+    e.g. a history whose last step is short followed by the query step (MemT Sec. 3.4 / 3.5)."""
+    cfg = model.config
+    if segments is None:
+        cfg.attention_segment_ids = None
+        return
+    if not getattr(cfg, "attention_segment", 0):
+        raise ValueError("explicit attention segments need set_attention_window(..., segment > 0)")
+    if any(e - s > cfg.sliding_window for s, e in segments):
+        raise ValueError("an attention step is longer than the sliding window")
+    ids = torch.empty(segments[-1][1], dtype=torch.long, device=next(model.parameters()).device)
+    for i, (s, e) in enumerate(segments):
+        ids[s:e] = i
+    cfg.attention_segment_ids = ids
 
 
 def _install_sink_masks():
@@ -65,7 +89,7 @@ def _install_sink_masks():
             kwargs["or_mask_function"] = _sink_overlay(sinks)
         segment = getattr(config, "attention_segment", 0)
         if segment:
-            kwargs["and_mask_function"] = _segment_overlay(segment, sinks)
+            kwargs["and_mask_function"] = _segment_overlay(segment, sinks, config)
         return original(config, *args, **kwargs)
 
     create_sliding_window_causal_mask._lact_sinks = True
@@ -89,6 +113,7 @@ def set_attention_window(model: nn.Module, window: Optional[int], sinks: int = 0
     if segment and (window is None or window < segment):
         raise ValueError("attention segments need a sliding window at least as long as the segment")
     cfg.attention_segment = int(segment)
+    cfg.attention_segment_ids = None
     if sinks or segment:
         if window is None:
             raise ValueError("attention sinks need a sliding window")
