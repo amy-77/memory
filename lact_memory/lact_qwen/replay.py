@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from .fast_weight import FastWeightState, fw_apply, fw_descent_direction, l2_norm, renorm_rows
 
@@ -55,6 +56,11 @@ class ReplayConfig:
     keep_per_segment: int = 32
     probe_src: str = "query"
     pseudo_target: str = "delta"
+    # Protected write: after a segment is written, the part of the update that would change the read-out at the
+    # banked keys is removed (null-space projection, as in AlphaEdit but on the fast weights). Exact for the
+    # keys in the bank: f_new(p) = f_old(p). Needs a key bank (mode "pseudo" with probe_src "bank" or "both").
+    protect: bool = False
+    protect_ridge: float = 1e-4
 
     def __post_init__(self):
         if self.mode not in REPLAY_MODES:
@@ -204,6 +210,36 @@ class ReplayBank:
                 a = a * (budget / (size + 1e-8)).clamp(max=1.0)[:, None, None]
             new.append(renorm_rows(w_c + a, ref))
         return FastWeightState(new[0], new[1], new[2], cand.m0, cand.m1, cand.m2, cand.replay, cand.raw)
+
+    @torch.no_grad()
+    def project(self, prev: FastWeightState, cand: FastWeightState) -> FastWeightState:
+        """Remove from the write prev -> cand everything that changes the read-out at the banked keys.
+
+        f(x) = w1 (silu(w0 x) * (w2 x)). If the rows of dW0 and dW2 are orthogonal to every banked key p, the
+        hidden features of p do not change; if the rows of dW1 are orthogonal to those features, neither does
+        the output. Both are least-squares projections (ridge only for conditioning)."""
+        if not self.cfg.protect or self.keys is None:
+            return cand
+        n = min(self.cfg.num_samples, self.scores.shape[1])
+        idx = self.scores.topk(n, dim=1).indices
+        P = torch.gather(self.keys, 1, idx[..., None].expand(-1, -1, self.keys.shape[-1])).to(cand.w0.device).float()
+
+        def proj(dw, basis):  # dw [BH, r, c], basis [BH, n, c] -> dw with its rows made orthogonal to the basis rows
+            g = basis @ basis.transpose(1, 2)
+            lam = self.cfg.protect_ridge * g.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12)
+            g = g + lam[:, None, None] * torch.eye(g.shape[1], device=g.device)
+            coef = torch.linalg.solve(g, basis @ dw.transpose(1, 2))  # [BH, n, r]
+            return dw - coef.transpose(1, 2) @ basis
+
+        with torch.autocast(device_type=cand.w0.device.type, enabled=False):  # the solves need float32
+            w0p, w1p, w2p = (w.float() for w in prev.weights())
+            w0c, w1c, w2c = (w.float() for w in cand.weights())
+            feat = F.silu(P @ w0p.transpose(1, 2)) * (P @ w2p.transpose(1, 2))  # [BH, n, e], unchanged by the projected write
+            new0 = w0p + proj(w0c - w0p, P)
+            new2 = w2p + proj(w2c - w2p, P)
+            new1 = w1p + proj(w1c - w1p, feat)
+        dt = cand.w0.dtype
+        return FastWeightState(new0.to(dt), new1.to(dt), new2.to(dt), cand.m0, cand.m1, cand.m2, cand.replay, cand.raw)
 
     # ---------------------------------------------------------------- observe
     @torch.no_grad()

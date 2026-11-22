@@ -265,6 +265,7 @@ def segmented_lact(
         )
         if replay is not None:
             state = replay.correct(prev, state, ks, ref_norms)
+            state = replay.project(prev, state)  # bank = keys of earlier segments only (observe comes after)
             replay.observe(ks, vs, lrs, None if scores is None else scores[:, s:e])
 
     return torch.cat(outputs, dim=1), state

@@ -326,6 +326,9 @@ class LaCTMemoryBranch(nn.Module):
             return segments, [True] * len(segments)
         if ctx.segments[-1][1] != length:
             raise ValueError(f"segments end at {ctx.segments[-1][1]} but sequence has {length} tokens")
+        lf = getattr(ctx, "layer_update_flags", None)  # {layer: flags}: a layer's own choice of which segments it writes
+        if lf is not None and self.layer_idx in lf and not ctx.capture_query:
+            return ctx.segments, lf[self.layer_idx]
         return ctx.segments, ctx.update_flags
 
     def _matrix_write(self, state: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -440,6 +443,16 @@ class LaCTMemoryBranch(nn.Module):
                 one = torch.ones(b, 1, dtype=torch.bool, device=q.device)
                 ctx.debug_scores[(self.layer_idx, "cos_incontext_last1")] = sim(kf, qt, one)
                 ctx.debug_scores[(self.layer_idx, "kernel_incontext_last1")] = sim(pk, phi(qt), one)
+            span = getattr(ctx, "debug_span", None)  # (start, end) of the question tokens in THIS forward
+            if span is not None:
+                qc = q.float()[:, span[0] : span[1]]  # every question token as it is read in context [BH, Nq, d]
+                mall = last_tokens(qm, 0)
+                ctx.debug_scores[(self.layer_idx, "cos_incontext_all")] = sim(kf, qc, mall)  # best-matching question token
+                sg = kf @ qc.transpose(1, 2)
+                mm = mall.repeat_interleave(h, dim=0)[:, None, :].to(sg.dtype)
+                ctx.debug_scores[(self.layer_idx, "cos_incontext_mean")] = (
+                    ((sg * mm).sum(-1) / mm.sum(-1).clamp_min(1)).view(b, h, -1).mean(dim=1).cpu()
+                )
 
         scores = gains = None
         sel = ctx.select
@@ -459,8 +472,13 @@ class LaCTMemoryBranch(nn.Module):
             scores = w.repeat_interleave(h, dim=0)
             lr = lr * scores[..., None].to(lr.dtype)
 
+        ltw = getattr(ctx, "layer_token_weights", None)  # {layer: [B, L]}: this layer's own choice of which keys it writes
+        if ltw is not None and self.layer_idx in ltw and not ctx.capture_query:
+            lr = lr * ltw[self.layer_idx].to(q.device).repeat_interleave(h, dim=0)[..., None].to(lr.dtype)
+
         if scores is None and ctx.bank_scores is not None and not ctx.capture_query:
-            scores = ctx.bank_scores.to(q.device).float().repeat_interleave(h, dim=0)
+            bs = ctx.bank_scores[self.layer_idx] if isinstance(ctx.bank_scores, dict) else ctx.bank_scores
+            scores = bs.to(q.device).float().repeat_interleave(h, dim=0)
 
         weights = self.fast_weights()
         state = ctx.states.get(self.layer_idx) if ctx.session else None

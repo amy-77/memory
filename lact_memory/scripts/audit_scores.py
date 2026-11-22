@@ -87,6 +87,7 @@ def main():
         ctx.set_segments(batch.segments, batch.update_flags)
         ctx.query_mask, ctx.query_span, ctx.debug_scores = qmask, None, {}
         ctx.debug_tailpos = torch.tensor([n_hist + len(r["q_ids"]) - 1 for r in batch.rows])
+        ctx.debug_span = (n_hist, n_hist + nq)
         keep = total - min(r["answer_span"][0] for r in batch.rows) + 1
         with torch.no_grad(), autocast(args):
             logits = model(input_ids=batch.input_ids.to(args.device), logits_to_keep=keep).logits

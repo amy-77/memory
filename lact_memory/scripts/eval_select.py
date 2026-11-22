@@ -21,6 +21,7 @@ import sys
 from collections import defaultdict
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -114,11 +115,27 @@ def main():
         "the history, reused for every turn; 'prefix' = the question is put in front of every turn",
     )
     p.add_argument("--turn-k", type=int, default=4, help="turn_* modes: number of turns written")
-    p.add_argument("--bank-score", default="lr", choices=["lr", "relevance"], help="turn_* + --replay pseudo with bank probes: "
+    p.add_argument("--bank-score", default="lr", choices=["lr", "relevance", "layer_qk"], help="turn_* + --replay pseudo with bank probes: "
+                   "'layer_qk' = every layer banks the keys its own question read vectors score highest; "
                    "which keys of a written turn enter the bank: 'lr' = learned write rate (question-agnostic), 'relevance' = "
                    "the question's per-token score (attention for turn_attn / turn_oracle / turn_random, layer q.k for turn_qk)")
+    p.add_argument("--protect", action="store_true", help="protected write: project every write onto the null space of the "
+                   "banked keys (needs --replay pseudo with --probe-src bank|both; --replay-lr-scale 0 = protection only)")
+    p.add_argument("--protect-ridge", type=float, default=None)
     p.add_argument("--probe-ctx", action="store_true", help="--replay pseudo: question probes = its read vectors in context "
                    "(from a first pass with every turn written) instead of the question alone")
+    p.add_argument("--qk-tokens", default="last1", choices=["last1", "all", "mean"], help="turn_qk: question tokens whose in-context "
+                   "read vectors score the keys: the last one, the best-matching of all, or the mean over all")
+    p.add_argument("--key-select", default="off", choices=["off", "layer", "random"], help="turn_* modes: inside every written turn, "
+                   "each layer writes only its own --key-frac best keys, scored with ITS OWN in-context question read vectors "
+                   "(--qk-tokens); 'random' = the same share of random tokens per layer (control)")
+    p.add_argument("--key-frac", type=float, default=0.25)
+    p.add_argument("--key-pool", type=int, default=7, help="--key-select layer: max-pool the token scores over this window first (SnapKV)")
+    p.add_argument("--per-layer", default="off", choices=["off", "own", "confident"], help="turn_qk: 'own' = every layer picks its own "
+                   "--turn-k turns with its own q.k (no layer is chosen, nothing is merged); 'confident' = the same, but a layer whose "
+                   "turn scores are flat (cannot tell the turns apart) writes every turn. --turn-layer is then ignored")
+    p.add_argument("--confident-z", type=float, default=2.5, help="--per-layer confident: a layer selects only if its best turn "
+                   "is at least this many standard deviations above its mean turn score")
     p.add_argument("--turn-layer", type=int, default=19, help="turn_qk: layer whose keys are scored")
     p.add_argument("--oracle-high", type=float, default=10.0, help="--select oracle: weight on the fact sentence")
     p.add_argument("--oracle-low", type=float, default=0.1, help="--select oracle: weight elsewhere in that turn")
@@ -136,6 +153,8 @@ def main():
         "bank_size": args.replay_bank,
         "kv_lr_scale": args.replay_lr_scale,
         "probe_src": args.probe_src,
+        "protect": True if args.protect else None,
+        "protect_ridge": args.protect_ridge,
         "pseudo_target": args.pseudo_target,
     }
     extra = {k: v for k, v in extra.items() if v is not None}
@@ -164,6 +183,10 @@ def main():
     import random as _random
     rng = _random.Random(0)
     hit = [0, 0]
+    layer_stat = [0, 0, 0]
+    key_stat = [0.0, 0]  # per-layer key selection: share of the fact sentence's tokens a layer keeps (mean over layers and rows)
+    key_gen = torch.Generator().manual_seed(0)
+    n_layers = len(model.model.layers) if hasattr(model, "model") else 0  # per-layer selection: layers that selected, of those how many kept the fact turn, layers in total
     corpus_counts = None
     if lexical and args.idf != "history":
         corpus_counts = torch.zeros(len(tok), dtype=torch.float32)
@@ -240,7 +263,8 @@ def main():
                 with torch.no_grad(), autocast(args):
                     model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
                 span_all, ctx.capture_span, ctx.span_q = ctx.span_q, None, {}
-            if turn_mode == "turn_qk":
+            dbg_all = {}
+            if turn_mode == "turn_qk" or args.key_select == "layer" or args.bank_score == "layer_qk":
                 nq = max(len(r["q_ids"]) for r in batch.rows)
                 qb = torch.full((len(batch.rows), nq), tok.pad_token_id, dtype=torch.long)
                 qm = torch.zeros(len(batch.rows), nq, dtype=torch.bool)
@@ -255,13 +279,19 @@ def main():
                 ctx.set_segments(batch.segments, batch.update_flags)
                 ctx.query_mask, ctx.query_span, ctx.debug_scores = qm, None, {}
                 ctx.debug_tailpos = torch.tensor([n_hist + len(r["q_ids"]) - 1 for r in batch.rows])
+                ctx.debug_span = (n_hist, n_hist + nq)
                 if args.probe_ctx:
                     ctx.capture_span, ctx.span_q = (n_hist, n_hist + nq_max), {}
+                _rmode = model.lact_cfg.replay.mode
+                model.lact_cfg.replay.mode = "none"  # the scoring pass writes every turn plainly (no rehearsal / protection)
                 with torch.no_grad(), autocast(args):
                     model(input_ids=batch.input_ids.to(args.device), logits_to_keep=1)
+                model.lact_cfg.replay.mode = _rmode
                 if args.probe_ctx:
                     span_all, ctx.capture_span, ctx.span_q = ctx.span_q, None, {}
-                dbg, ctx.debug_scores, ctx.debug_tailpos = ctx.debug_scores[(args.turn_layer, "cos_incontext_last1")], None, None
+                dbg_all = {l: t for (l, name), t in ctx.debug_scores.items() if name == "cos_incontext_" + args.qk_tokens}
+                dbg, ctx.debug_scores, ctx.debug_tailpos = dbg_all.get(args.turn_layer), None, None
+                ctx.debug_span = None
                 ctx.query_q = {}
             results = []
             for i, r in enumerate(batch.rows):
@@ -291,11 +321,52 @@ def main():
                         if want_attn_tok:
                             tokrel[0, s_:e_] = attn_acc["sum"].cpu()
                 top = set(sorted(range(len(spans)), key=lambda j: -sc[j])[: args.turn_k])
-                hit[0] += ft in top; hit[1] += 1
                 flags = [j in top for j in range(len(spans))] + list(batch.update_flags[len(spans):])
+                ctx.layer_update_flags = None
+                if turn_mode == "turn_qk" and args.per_layer != "off":
+                    lf, nsel, nhit = {}, 0, 0
+                    for l, t in dbg_all.items():
+                        scl = torch.tensor([float(t[i, s_:e_].float().topk(min(5, e_ - s_)).values.mean()) for s_, e_ in spans])
+                        z = float((scl.max() - scl.mean()) / (scl.std() + 1e-9))
+                        if args.per_layer == "confident" and z < args.confident_z:
+                            lf[l] = [True] * len(spans) + list(batch.update_flags[len(spans):])   # cannot tell: write all
+                            continue
+                        tl = set(scl.topk(min(args.turn_k, len(spans))).indices.tolist())
+                        lf[l] = [j in tl for j in range(len(spans))] + list(batch.update_flags[len(spans):])
+                        nsel += 1; nhit += ft in tl
+                    ctx.layer_update_flags = lf
+                    layer_stat[0] += nsel; layer_stat[1] += nhit; layer_stat[2] += len(dbg_all)
+                    hit[0] += nhit > 0; hit[1] += 1
+                else:
+                    hit[0] += ft in top; hit[1] += 1
+                ctx.layer_token_weights = None
+                if args.key_select != "off":
+                    ltw, total = {}, batch.input_ids.shape[1]
+                    fa, fb = (fact_tok[i][0], fact_tok[i][1]) if fact_tok[i] is not None else (0, 0)
+                    for l in (sorted(dbg_all) if dbg_all else range(n_layers)):
+                        wl = torch.ones(1, total)
+                        for s_, e_ in spans:
+                            n_ = e_ - s_
+                            m_ = max(1, int(round(args.key_frac * n_)))
+                            if args.key_select == "random":
+                                idx = torch.randperm(n_, generator=key_gen)[:m_]
+                            else:
+                                st = dbg_all[l][i, s_:e_].float()
+                                if args.key_pool > 1:
+                                    st = F.max_pool1d(st[None, None], args.key_pool, 1, args.key_pool // 2)[0, 0, :n_]
+                                idx = st.topk(m_).indices
+                            wl[0, s_:e_] = 0.0
+                            wl[0, s_ + idx] = 1.0
+                        ltw[l] = wl
+                        if fb > fa:
+                            key_stat[0] += float(wl[0, fa:fb].mean()); key_stat[1] += 1
+                    ctx.layer_token_weights = ltw
                 one = type(batch)(batch.input_ids[i : i + 1], None, batch.segments, flags, [r])
                 qm1 = None
-                ctx.bank_scores = tokrel if args.bank_score == "relevance" else None
+                if args.bank_score == "layer_qk":
+                    ctx.bank_scores = {l: t[i : i + 1].float() for l, t in dbg_all.items()}
+                else:
+                    ctx.bank_scores = tokrel if args.bank_score == "relevance" else None
                 if args.replay == "pseudo" and span_all is not None:
                     nq_i, hh = len(r["q_ids"]), next(iter(span_all.values())).shape[0] // len(batch.rows)
                     ctx.query_q = {l: t[i * hh : (i + 1) * hh, :nq_i] for l, t in span_all.items()}
@@ -310,7 +381,7 @@ def main():
                         model(input_ids=qrow.to(args.device), logits_to_keep=1)
                     ctx.capture_query = False
                 results.extend(run(one, n_hist, [fact_tok[i]], [turn_span[i]], [queries[i]], qm1, None))
-                ctx.query_q, ctx.bank_scores = {}, None
+                ctx.query_q, ctx.bank_scores, ctx.layer_update_flags, ctx.layer_token_weights = {}, None, None, None
             n_show = n_hist
         elif args.query_source == "prefix":
             # the question is put in front of every turn; one row at a time because rows differ in length
@@ -414,6 +485,12 @@ def main():
 
     if turn_mode:
         print(f"\nturn selection {turn_mode} k={args.turn_k} layer={args.turn_layer}: fact turn written in {hit[0]}/{hit[1]} rows")
+        if key_stat[1]:
+            print(f"key selection {args.key_select} frac={args.key_frac} pool={args.key_pool}: a layer keeps {key_stat[0] / key_stat[1]:.2f} "
+                  f"of the fact sentence's tokens (random would keep about {args.key_frac:.2f})")
+        if layer_stat[2]:
+            print(f"per-layer {args.per_layer}: {layer_stat[0] / layer_stat[2]:.2f} of the layers selected; "
+                  f"a selecting layer kept the fact turn in {layer_stat[1] / max(layer_stat[0], 1):.2f} of the cases")
         args.select = turn_mode
     print(f"\nselect={args.select} boost={args.boost} idf={os.path.basename(args.idf)} source={args.query_source} tau={args.tau} cap={args.cap} seg_gain={args.seg_gain} "
           f"keep={args.keep} pool={args.pool}/{args.pool_mode} qlast={args.query_last} topk={args.topk_frac} replay={args.replay or 'from-config'} probes={args.probe_src} target={args.pseudo_target} "
