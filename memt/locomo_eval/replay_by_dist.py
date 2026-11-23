@@ -7,7 +7,7 @@ def load(n):
 def sign_p(a, b):
     n, k = a + b, min(a, b)
     return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
-for x, y in [("C_write_R16", "C_write"), ("C_write_R16a05", "C_write"), ("K2_attc_R16", "K2_attc"), ("F_evidence_R16", "F_evidence")]:
+for x, y in [("C_write_R16g", "C_write"), ("C_write_R16g", "C_write_R16"), ("K2_bm25_R16", "K2_bm25"), ("C_write_R16", "C_write"), ("C_write_R16a05", "C_write"), ("K2_attc_R16", "K2_attc"), ("F_evidence_R16", "F_evidence")]:
     X, Y = load(x), load(y); ks = sorted(set(X) & set(Y))
     a = sum(X[k]["judge"] and not Y[k]["judge"] for k in ks); b = sum(Y[k]["judge"] and not X[k]["judge"] for k in ks)
     print(f"{x} vs {y}: {sum(X[k]['judge'] for k in ks)} vs {sum(Y[k]['judge'] for k in ks)}  only-first {a} only-second {b}  sign-test p={sign_p(a, b):.3f}")
