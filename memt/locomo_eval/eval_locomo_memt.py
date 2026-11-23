@@ -101,6 +101,9 @@ def main():
     p.add_argument("--replay-k", type=int, default=0,
                    help="Robins-style rehearsal with the question's own memory queries: probes per head; 0 = off")
     p.add_argument("--replay-alpha", type=float, default=1.0, help="rehearsal strength (1 = restore the read-out)")
+    p.add_argument("--replay-gate", default=None,
+                   help="rehearse a write only if the incoming chunk scores lower (this scorer, needs --scores) than the "
+                        "best chunk already written, i.e. never resist a chunk more relevant than the memory content")
     p.add_argument("--out", required=True)
     add_model_args(p)
     args = p.parse_args()
@@ -126,7 +129,7 @@ def main():
                             tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int) and i >= 0}
 
     SC = {}
-    if args.mode == "scored":
+    if args.mode == "scored" or args.replay_gate:
         for pat in args.scores.split(","):            # first pattern = base scores; later ones add score keys
             for f in glob.glob(pat):
                 for r_ in json.load(open(f)):
@@ -175,6 +178,7 @@ def main():
         for i, c in enumerate(convs):
             donor_hist[c] = encode(first[convs[(i + 1) % len(convs)]], tok)[0]
     recs, t0, n_written, n_chunks, n_ev, n_hit = [], time.time(), 0, 0, 0, 0
+    n_gate = [0, 0]   # writes onto a non-empty memory: rehearsed, total
     for ri, dlg in enumerate(rows):
         if ri % args.nshards != args.shard:
             continue
@@ -252,12 +256,23 @@ def main():
                                 forward_chunk(model, torch.tensor([dh[s_:e_]], device=dev), s_, update=True)
                             n_written += len(db) - len(flags)
                             flags = set()
+                        gsc, best = None, None
+                        if R_ is not None and args.replay_gate:
+                            r_ = SC[(ri, qi)]
+                            assert r_["n_chunks"] == len(earlier) and r_["evidence"] == sorted(evid), (ri, qi)
+                            gsc = strategy_scores(r_, args.replay_gate, ri, qi) if earlier else []
                         for j in earlier:
                             if j in flags:
                                 s_, e_ = bounds[j]
+                                if gsc is not None:
+                                    on = best is not None and gsc[j] < best
+                                    R_.REPLAY["k"] = args.replay_k if on else 0
+                                    if best is not None:
+                                        n_gate[0] += on; n_gate[1] += 1
+                                    best = gsc[j] if best is None else max(best, gsc[j])
                                 forward_chunk(model, torch.tensor([seq[s_:e_]], device=dev), s_, update=True)
                         if R_ is not None:
-                            R_.REPLAY["q"] = None
+                            R_.REPLAY["q"] = None; R_.REPLAY["k"] = args.replay_k
                         # the last chunk only reads: every token of a chunk reads the state left by the earlier
                         # chunks (memory_branch._read_matrix), so update=False gives the same output as in training
                         step = lambda ids: forward_chunk(model, torch.tensor([ids], device=dev), fs, update=False)
@@ -288,6 +303,8 @@ def main():
         st = R_.REPLAY["stats"]
         summ["replay"] = {"layer_writes": st["writes"], "layer_writes_with_rehearsal": st["replayed"],
                           "mean_relative_restore_error": st["restore_err"] / max(1, st["restore_n"])}
+        if args.replay_gate:
+            summ["replay"]["gate_rehearsed_writes"], summ["replay"]["gate_nonfirst_writes"] = n_gate
         print("replay", summ["replay"], flush=True)
     print("chunks written", n_written, "of", n_chunks, "earlier chunks; evidence chunks written", n_hit, "of", n_ev, flush=True)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
