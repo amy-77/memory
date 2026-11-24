@@ -1,34 +1,32 @@
-"""Hand-written backward passes for the MemT-1.0-Nano memory branch (modeling_memt.py).
+"""MemT-1.0-Nano 记忆分支(modeling_memt.py)的手写 backward。
 
-The three pieces follow the three items of the task:
+三部分对应任务的三项:
 
-1. ``GatedRMSNormFn``: ``MemTRMSNormGated`` (RMS norm, SiLU output gate, tanh soft cap at line 51).
-2. ``MemoryResidualFn``: the memory part of ``MemTAttention.forward`` (line 257-266). The memory read is added to
-   the attention output and the updated state is handed to ``memory_call.results``; the incoming read/write states
-   may live on another device, and their gradients go back to that device.
-3. ``MemTMemoryFn`` (+ ``memory_forward`` / ``memory_backward``): ``MemTMemory.forward`` (line 92-132), including the
-   sqrt-erase delta-rule write. Two writers compute the same recurrence:
-   - ``writer="block"`` (default): stable chunked WY form (as MemT trains, report section 4). Blocks of 64 tokens are
-     solved with matrix products and one triangular solve; only decay ratios exp(G_t - G_s) <= 1 appear, so any decay
-     is fine. Forward keeps the FP32 state entering every ``ckpt_every`` tokens; backward recomputes one group of
-     ``ckpt_every`` tokens from it and differentiates that group with autograd.
-   - ``writer="token"``: the released token loop with a hand-written per-token backward (kept as a reference).
+1. ``GatedRMSNormFn``:对应 ``MemTRMSNormGated``(RMS 归一化、SiLU 输出门、第 51 行的 tanh 软上限)。
+2. ``MemoryResidualFn``:对应 ``MemTAttention.forward`` 里的记忆部分(第 257-266 行)。记忆读出加到注意力输出上,
+   更新后的状态交给 ``memory_call.results``;传入的读/写状态可能在另一张卡上,它们的梯度会送回那张卡。
+3. ``MemTMemoryFn``(以及 ``memory_forward`` / ``memory_backward``):对应 ``MemTMemory.forward``(第 92-132 行),
+   包括带 sqrt 擦除门的 delta 规则写入。两种写入算法计算的是同一个递推:
+   - ``writer="block"``(默认):分块 WY 形式(MemT 训练时的做法,见报告第 4 节)。每 ``ckpt_every`` 个 token 一组:
+     组内总衰减小时用快公式一次求解;否则用稳定公式,每 64 个 token 做一次矩阵乘法加三角求解,
+     只出现衰减比 exp(G_t - G_s) <= 1,衰减多大都可以。前向保存每组开始时的 FP32 状态;
+     反向从存档重算这一组,组内用 autograd 求导。
+   - ``writer="token"``:官方的逐 token 循环,配手写的逐 token backward(保留作参照)。
 
-Apart from the writer, the forward arithmetic copies the released code op for op (same casts, same order): reads are
-bitwise identical to modeling_memt.py, the written state agrees to FP32 rounding (block writer) or bitwise (token
-writer). Backward is computed in FP32. Dtype casts in the forward are treated as identity, as autograd does; unlike
-autograd under BF16, intermediate gradients are not rounded to BF16.
+除写入算法外,前向的每一步运算都照抄官方代码(同样的类型转换、同样的顺序):读出与 modeling_memt.py 逐位相同;
+写入后的状态,block 算法与官方相差 FP32 舍入量级,token 算法逐位相同。反向在 FP32 下计算。
+前向里的类型转换在反向时当作恒等(与 autograd 一致);不同的是,这里不会像 BF16 下的 autograd 那样
+把中间梯度舍入到 BF16。
 
-Recurrence of one write step (per batch, head; S is K x V, u, d in R^K, w in R^V):
+一步写入的递推(每个 batch、每个头;S 为 K x V,u、d 属于 R^K,w 属于 R^V):
     P_t = diag(d_t) S_{t-1}
     S_t = P_t + u_t (w_t - P_t^T u_t)^T
-Backward of one step, with G = dL/dS_t:
+一步的反向,记 G = dL/dS_t:
     g     = G^T u_t                       -> dL/dw_t = g
     dL/du_t = G (w_t - P_t^T u_t) - P_t g
     dP    = G - u_t g^T
     dL/dd_t = rowsum(dP * S_{t-1})
-    dL/dS_{t-1} = diag(d_t) dP
-"""
+    dL/dS_{t-1} = diag(d_t) dP"""
 
 from __future__ import annotations
 
@@ -37,7 +35,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-_L2_EPS = 1e-6  # MemTMemory._normalize
+_L2_EPS = 1e-6  # 对应 MemTMemory._normalize
 
 
 @dataclass(frozen=True)
@@ -48,18 +46,18 @@ class MemoryConfig:
     norm_eps: float
     softcap: bool
     limit: float
-    ckpt_every: int = 256  # tokens between saved write states
-    writer: str = "block"  # "block" (stable chunked WY) or "token" (released loop, per-token backward)
-    block: int = 64  # tokens per triangular solve of the block writer
+    ckpt_every: int = 256  # 保存写入状态的间隔(token 数)
+    writer: str = "block"  # "block"(分块 WY)或 "token"(官方逐 token 循环,逐 token 反向)
+    block: int = 64  # block 算法里稳定公式每次三角求解的 token 数
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# 1. Gated RMS norm with soft cap (MemTRMSNormGated, line 36-52)
+# 1. 带软上限的门控 RMS 归一化(MemTRMSNormGated,第 36-52 行)
 # --------------------------------------------------------------------------------------------------------------------
 
 
 def gated_rmsnorm_forward(value, gate, weight, eps, softcap, limit):
-    """Same arithmetic as MemTRMSNormGated.forward."""
+    """与 MemTRMSNormGated.forward 的算式相同。"""
     normalized = value.float() * torch.rsqrt(value.float().square().mean(-1, keepdim=True) + eps)
     normalized = weight * normalized.to(value.dtype)
     activated = F.silu(gate.float())
@@ -69,18 +67,17 @@ def gated_rmsnorm_forward(value, gate, weight, eps, softcap, limit):
 
 
 def _gated_rmsnorm_grads(grad, value, gate, weight, eps, softcap, limit):
-    """FP32 gradients of out = (weight * n) * a with
+    """out = (weight * n) * a 的 FP32 梯度,其中
         n = v * rstd,  rstd = (mean(v^2) + eps)^(-1/2)
-        a = c * tanh(silu(g) / c)      (a = silu(g) without the soft cap)
-    d weight = sum over rows of grad * a * n
+        a = c * tanh(silu(g) / c)      (没有软上限时 a = silu(g))
+    d weight = 对所有行求和 grad * a * n
     d g      = grad * weight * n * (1 - tanh^2(silu(g) / c)) * sigmoid(g) * (1 + g * (1 - sigmoid(g)))
-    d v      = rstd * (dn - n * mean(dn * n)),   dn = grad * a * weight
-    """
+    d v      = rstd * (dn - n * mean(dn * n)),   dn = grad * a * weight"""
     grad = grad.float()
     v = value.float()
     rstd = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
     n = v * rstd
-    n_used = n.to(value.dtype).float()  # the forward multiplies the rounded normalized value
+    n_used = n.to(value.dtype).float()  # 前向乘的是舍入后的归一化值
     w = weight.float()
     g = gate.float()
     sig = torch.sigmoid(g)
@@ -120,20 +117,20 @@ class GatedRMSNormFn(torch.autograd.Function):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# 3a. Delta-rule write (MemTMemory.forward, line 125-131)
+# 3a. delta 规则写入(MemTMemory.forward,第 125-131 行)
 # --------------------------------------------------------------------------------------------------------------------
 
 
 def delta_rule_step(state, u, write_value, decay):
-    """One token of the write loop (line 128-131), same ops."""
+    """写入循环里的一个 token(第 128-131 行),运算相同。"""
     state = state * decay.unsqueeze(-1)
     erase = (u.unsqueeze(-1) * state).sum(-2)
     return state + u.unsqueeze(-1) * (write_value - erase).unsqueeze(-2)
 
 
 def delta_rule_forward(state, key, write_value, decay, every):
-    """key, decay: [B, L, H, K]; write_value: [B, L, H, V]; state: [B, H, K, V].
-    Returns the final state and the states entering tokens 0, every, 2*every, ..."""
+    """key, decay: [B, L, H, K];write_value: [B, L, H, V];state: [B, H, K, V]。
+    返回最终状态,以及进入第 0、every、2*every、... 个 token 时的状态。"""
     checkpoints = []
     for index in range(key.shape[1]):
         if index % every == 0:
@@ -143,7 +140,7 @@ def delta_rule_forward(state, key, write_value, decay, every):
 
 
 def delta_rule_backward(grad_state, checkpoints, key, write_value, decay, every):
-    """Returns dL/d(initial state), dL/dkey, dL/dwrite_value, dL/ddecay (see the module docstring)."""
+    """返回 dL/d(初始状态)、dL/dkey、dL/dwrite_value、dL/ddecay(公式见模块开头的说明)。"""
     length = key.shape[1]
     d_key = torch.zeros_like(key)
     d_write = torch.zeros_like(write_value)
@@ -174,12 +171,12 @@ def delta_rule_backward(grad_state, checkpoints, key, write_value, decay, every)
 
 
 def delta_block_stable(state, u, z, lam):
-    """One block of the write in chunked WY form, exact for any lam <= 0.
-    state [N, K, V]; u, lam [N, C, K]; z [N, C, V]. With G = cumsum(lam) inside the block:
+    """写入的一个块,分块 WY 形式,对任意 lam <= 0 都精确。
+    state [N, K, V];u, lam [N, C, K];z [N, C, V]。记 G = 块内 cumsum(lam):
         L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)   (s < t)
         (I + L) E = Z - (exp(G) * U) S_0
         S_C = exp(G_C) * S_0 + (exp(G_C - G) * U)^T E
-    Only exp of non-positive numbers appears (decay ratios <= 1)."""
+    只对非正数取 exp(衰减比 <= 1)。"""
     c = u.shape[1]
     g = lam.cumsum(dim=1)
     pair = g[:, :, None, :] - g[:, None, :, :]  # [N, t, s, K] = G_t - G_s
@@ -193,8 +190,8 @@ def delta_block_stable(state, u, z, lam):
 
 
 def delta_block_scaled(state, u, z, lam):
-    """The same block in the scaled form (1 / P_t factors). ~9x faster than the stable form but 1 / P_t grows like
-    exp(total decay of the block), so it is only used while that total stays within FAST_MAX_LOG_GROWTH."""
+    """同一个块的快公式(带 1 / P_t 因子)。比稳定公式快约 9 倍,但 1 / P_t 会按 exp(块内总衰减) 增长,
+    所以只在总衰减不超过 FAST_MAX_LOG_GROWTH 时使用。"""
     grow = torch.exp(-lam.cumsum(dim=1))  # 1 / P_t
     a, b = u * grow, u / grow
     lower = torch.tril(b @ a.transpose(1, 2), diagonal=-1)
@@ -202,14 +199,14 @@ def delta_block_scaled(state, u, z, lam):
     return (state + a.transpose(1, 2) @ e) / grow[:, -1, :, None]
 
 
-# Largest total decay of a group for the scaled form: 1 / P_t <= exp(7.68) ~ 2200 (0.03 per token over 256 tokens,
-# the range the 4B framework's scaled writer has run in; FP32 error stays below 1e-4 there).
+# 快公式允许的一组内最大总衰减:1 / P_t <= exp(7.68) ~ 2200(每 token 0.03、共 256 个 token,
+# 即 4B 框架的快公式一直运行的范围;此范围内 FP32 误差低于 1e-4)。
 FAST_MAX_LOG_GROWTH = 0.03 * 256
 
 
 def _write_group(state, u, z, lam, block):
-    """A group of tokens (at most `ckpt_every`): scaled form in one solve if its total decay is small in every
-    channel, otherwise the stable form in blocks of `block` tokens. Both are exact; nothing is clipped."""
+    """一组 token(最多 `ckpt_every` 个):各通道总衰减都小时,用快公式一次求解;
+    否则用稳定公式,每 `block` 个 token 一块。两者都精确,没有任何截断。"""
     if u.shape[1] <= 256 and float((-lam).sum(dim=1).amax()) <= FAST_MAX_LOG_GROWTH:
         return delta_block_scaled(state, u, z, lam)
     for s in range(0, u.shape[1], block):
@@ -224,8 +221,8 @@ def _heads_first(t):
 
 
 def block_write_forward(state, key, write_value, lam, block, every):
-    """state [B, H, K, V]; key, lam [B, L, H, K]; write_value [B, L, H, V] (FP32).
-    Returns the final state [B, H, K, V] and the states [B * H, K, V] entering tokens 0, every, 2 * every, ..."""
+    """state [B, H, K, V];key, lam [B, L, H, K];write_value [B, L, H, V](FP32)。
+    返回最终状态 [B, H, K, V],以及进入第 0、every、2 * every、... 个 token 时的状态 [B * H, K, V]。"""
     b, h = state.shape[:2]
     u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
     s = state.reshape(b * h, *state.shape[2:])
@@ -237,9 +234,9 @@ def block_write_forward(state, key, write_value, lam, block, every):
 
 
 def block_write_backward(grad_state, checkpoints, key, write_value, lam, block, every):
-    """Gradients of block_write_forward: d state, d key, d write_value, d lam. Each group of `every` tokens is
-    recomputed from its saved state and differentiated with autograd (MemT: "reconstructing intermediate quantities
-    during backward")."""
+    """block_write_forward 的梯度:d state、d key、d write_value、d lam。每组 `every` 个 token
+    从保存的状态重算,组内用 autograd 求导(MemT 报告:"reconstructing intermediate quantities
+    during backward")。"""
     b, length, h, _ = key.shape
     u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
     d_u, d_z, d_g = torch.zeros_like(u), torch.zeros_like(z), torch.zeros_like(g)
@@ -261,7 +258,7 @@ def block_write_backward(grad_state, checkpoints, key, write_value, lam, block, 
 
 
 class BlockWriteFn(torch.autograd.Function):
-    """The block writer alone (used by the tests; MemTMemoryFn calls the same functions)."""
+    """只包含 block 写入(测试用;MemTMemoryFn 调用的是同一组函数)。"""
 
     @staticmethod
     def forward(ctx, state, key, write_value, lam, block, every):
@@ -278,7 +275,7 @@ class BlockWriteFn(torch.autograd.Function):
 
 
 class DeltaRuleFn(torch.autograd.Function):
-    """The write recurrence alone (used by the tests; MemTMemoryFn calls the same functions)."""
+    """只包含逐 token 写入递推(测试用;MemTMemoryFn 调用的是同一组函数)。"""
 
     @staticmethod
     def forward(ctx, state, key, write_value, decay, every):
@@ -297,10 +294,10 @@ class DeltaRuleFn(torch.autograd.Function):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# 3b. The whole memory block (MemTMemory.forward, line 92-132)
+# 3b. 整个记忆模块(MemTMemory.forward,第 92-132 行)
 # --------------------------------------------------------------------------------------------------------------------
-# params = (in_proj.weight, f_down.weight, g_down.weight, g_down.bias or None, decay_bias, decay_scale_log,
-#           o_norm.weight). in_proj rows: q, k, v, b, w (value_dim each), f, g (head_dim each).
+# params = (in_proj.weight, f_down.weight, g_down.weight, g_down.bias 或 None, decay_bias, decay_scale_log,
+#           o_norm.weight)。in_proj 的行依次是:q、k、v、b、w(各 value_dim 行),f、g(各 head_dim 行)。
 
 
 def _normalize(value, rounded):
@@ -314,8 +311,8 @@ def _l2norm_backward(d_normalized, normalized, rstd):
 
 
 def memory_forward(hidden, params, snapshot, write_state, commit, cfg, with_checkpoints=False):
-    """MemTMemory.forward for a given snapshot (the caller handles state=None without commit).
-    Returns read [B, L, H*D], updated state (or None) and the write checkpoints (or None)."""
+    """给定快照时的 MemTMemory.forward(state=None 且不写入的情况由调用方处理)。
+    返回读出 [B, L, H*D]、更新后的状态(或 None)、写入的存档(或 None)。"""
     in_w, f_w, g_w, g_b, decay_bias, decay_scale_log, norm_w = params
     batch, length, _ = hidden.shape
     heads, dim = cfg.num_heads, cfg.head_dim
@@ -341,7 +338,7 @@ def memory_forward(hidden, params, snapshot, write_state, commit, cfg, with_chec
         -decay_scale_log.float().exp().reshape(heads, 1)
         * F.softplus(F.linear(f, f_w).float() + decay_bias.float()).reshape(shape)
     )
-    decay = log_decay.exp()  # same ops as the released expression
+    decay = log_decay.exp()  # 与官方表达式的运算相同
     start = snapshot.float() if write_state is None else write_state.float()
     if with_checkpoints and cfg.writer == "block":
         updated, checkpoints = block_write_forward(start, key, write_value, log_decay, cfg.block, cfg.ckpt_every)
@@ -356,8 +353,8 @@ def memory_forward(hidden, params, snapshot, write_state, commit, cfg, with_chec
 
 
 def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_state, checkpoints, commit, cfg):
-    """Gradients of memory_forward. grad_read / grad_updated may be None (output unused).
-    Returns d_hidden, d_params (same order as params), d_snapshot, d_write_state."""
+    """memory_forward 的梯度。grad_read / grad_updated 可以是 None(该输出没被用到)。
+    返回 d_hidden、d_params(顺序同 params)、d_snapshot、d_write_state。"""
     in_w, f_w, g_w, g_b, decay_bias, decay_scale_log, norm_w = params
     batch, length, _ = hidden.shape
     heads, dim = cfg.num_heads, cfg.head_dim
@@ -367,7 +364,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
     x = hidden.float()
     snap = snapshot.float()
 
-    # ---- recompute the forward pieces (cheap projections; the states come from the checkpoints) ----
+    # ---- 重算前向的各个量(投影很便宜;状态取自存档) ----
     projected = F.linear(hidden, in_w[: 3 * width if commit else width])
     q_raw = projected[..., :width].reshape(shape).float()
     q_rstd = torch.rsqrt(q_raw.square().sum(-1, keepdim=True) + _L2_EPS)
@@ -376,7 +373,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
     gate_in = F.linear(hidden, in_w[-dim:])
     gate = F.linear(gate_in, g_w, g_b).reshape(shape)
 
-    # ---- read path: read = o_norm(scale * q_hat S_snapshot, gate) ----
+    # ---- 读路径:read = o_norm(scale * q_hat S_snapshot, gate) ----
     if grad_read is not None:
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             read_raw = cfg.read_scale * torch.einsum("blhk,bhkv->blhv", q_used, snap)
@@ -390,23 +387,23 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         d_g_w = torch.einsum("blo,bli->oi", d_gate, gate_in.float())
         d_g_b = d_gate.sum((0, 1)) if g_b is not None else None
         d_gate_in = d_gate @ g_w.float()
-    else:  # read unused: its own parameters get None, as with autograd
+    else:  # 读出没被用到:只属于读路径的参数梯度为 None,与 autograd 一致
         d_snapshot = torch.zeros_like(snap)
         d_q = x.new_zeros(flat)
         d_norm_w = d_g_w = d_g_b = None
         d_gate_in = x.new_zeros(batch, length, dim)
 
-    d_f_w = d_decay_bias = d_scale_log = None  # write-only parameters: None without commit
+    d_f_w = d_decay_bias = d_scale_log = None  # 只在写入时用到的参数:不写入时梯度为 None
     d_write_state = None
     x_2d = x.reshape(-1, x.shape[-1])
     if not commit:
-        # only the q rows and the g rows of in_proj were used
+        # 只用到了 in_proj 的 q 行和 g 行
         d_in_w = torch.zeros(in_w.shape, dtype=torch.float32, device=in_w.device)
         d_in_w[:width] = d_q.reshape(-1, width).t() @ x_2d
         d_in_w[-dim:] = d_gate_in.reshape(-1, dim).t() @ x_2d
         d_hidden = d_q @ in_w[:width].float() + d_gate_in @ in_w[-dim:].float()
     else:
-        # ---- write path ----
+        # ---- 写路径 ----
         k_raw = projected[..., width : 2 * width].reshape(shape)
         value = projected[..., 2 * width :].reshape(shape)
         k_rstd = torch.rsqrt(k_raw.float().square().sum(-1, keepdim=True) + _L2_EPS)
@@ -425,7 +422,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         log_decay = -scale * softplus_z.reshape(shape)
         decay = log_decay.exp()
 
-        # d_exponent = dL / d(log decay)
+        # d_exponent = dL / d(log 衰减)
         if grad_updated is None:
             d_start = torch.zeros_like(snap)
             d_u = torch.zeros_like(u)
@@ -449,7 +446,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         d_w = (d_wv * value.float() * sig_w * (1 - sig_w)).reshape(flat)
         # decay = exp(-exp(scale_log) * softplus(f_down(f) + decay_bias))
         d_scale_log = -(d_exponent * scale * softplus_z.reshape(shape)).sum((0, 1, 3))
-        softplus_grad = torch.where(z > 20, torch.ones_like(z), torch.sigmoid(z))  # F.softplus threshold 20
+        softplus_grad = torch.where(z > 20, torch.ones_like(z), torch.sigmoid(z))  # F.softplus 的阈值 20
         d_z = (-(d_exponent * scale)).reshape(flat) * softplus_grad
         d_decay_bias = d_z.sum((0, 1))
         d_f_w = torch.einsum("blo,bli->oi", d_z, f.float())
@@ -458,7 +455,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
             d_snapshot = d_snapshot + d_start
         else:
             d_write_state = d_start
-        # ---- in_proj: rows = [q, k, v, b, w, f, g] ----
+        # ---- in_proj:行 = [q, k, v, b, w, f, g] ----
         d_rows = torch.cat([d_q, d_k, d_v, d_b, d_w, d_f, d_gate_in], -1)
         d_in_w = d_rows.reshape(-1, d_rows.shape[-1]).t() @ x_2d
         d_hidden = d_rows @ in_w.float()
@@ -484,7 +481,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
 
 
 class MemTMemoryFn(torch.autograd.Function):
-    """MemTMemory.forward with a given snapshot. Returns read, or (read, updated) when commit."""
+    """给定快照时的 MemTMemory.forward。返回读出;写入时返回 (读出, 更新后的状态)。"""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
@@ -514,21 +511,20 @@ class MemTMemoryFn(torch.autograd.Function):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# 2. Memory part of MemTAttention.forward (line 257-266)
+# 2. MemTAttention.forward 里的记忆部分(第 257-266 行)
 # --------------------------------------------------------------------------------------------------------------------
 
 
 class MemoryResidualFn(torch.autograd.Function):
-    """output + memory read, and the updated state, as one node:
+    """输出 + 记忆读出,以及更新后的状态,合成一个节点:
 
-        state  = memory_call.read[layer].to(device)        (zeros if absent and commit)
-        writer = memory_call.write[layer].to(device)        (None if absent)
+        state  = memory_call.read[layer].to(device)        (没有且要写入时为全零)
+        writer = memory_call.write[layer].to(device)        (没有时为 None)
         read, updated = memory(hidden, state, commit, write_state=writer)
         output = output + read.to(output.dtype)
 
-    Backward: d output passes through; d read = d output; memory_backward gives d hidden, d params and the
-    gradients of state / writer, which are moved back to the devices those tensors came from.
-    """
+    反向:d output 原样传回;d read = d output;memory_backward 给出 d hidden、d params,
+    以及 state / writer 的梯度,这两个梯度会送回各自张量原来所在的设备。"""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")

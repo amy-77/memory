@@ -1,17 +1,17 @@
-"""Checks of the hand-written MemT backward against autograd through the released forward.
+"""手写的 MemT backward 与"官方 forward 直接走 autograd"的对照检查。
 
-    python tests/test_backward.py            # CPU checks 1-5
-    python tests/test_backward.py --gpu      # + check 6: Nano-size memory layer, speed and peak memory
+    python tests/test_backward.py                                # CPU 检查 1-5
+    python tests/test_backward.py --gpu                          # 加检查 6:Nano 尺寸的记忆层,速度和显存峰值
+    python tests/test_backward.py --gpu-only --length 512 2048   # 只跑检查 6
 
-1. MemTRMSNormGated (soft cap on/off, FP32/BF16): forward bitwise equal, gradients vs autograd
-2. write recurrence alone: torch.autograd.gradcheck in FP64
-3. MemTMemory, all read/commit/state/write_state/bias/softcap combinations, FP32: forward bitwise, gradients
-4. MemTMemory in BF16: forward bitwise, gradients close to BF16 autograd
-5. tiny MemT model end to end (frozen backbone): commit_memory_train over several chunks (document and QA-event
-   replay), then a query; loss and memory-parameter gradients vs the released code under autograd; and the no-grad
-   commit_memory output bitwise equal to the released file
-6. (--gpu) one Nano-size memory layer (2048 hidden, 16 heads x 256, 2048 tokens, BF16): time / peak memory
-"""
+1. MemTRMSNormGated(软上限开/关,FP32/BF16):前向逐位相同,梯度与 autograd 对比
+2. 写入递推本身:FP64 下的 torch.autograd.gradcheck;block 算法与逐 token 循环一致
+3. MemTMemory,读/写/state/write_state/bias/软上限的全部组合,FP32,两种写入算法:前向和梯度
+4. BF16 下的 MemTMemory:读出逐位相同,梯度接近 BF16 的 autograd
+5. 小型 MemT 模型端到端(backbone 冻结):commit_memory_train 写入多个 chunk(文档模式,以及文档 + QA 事件回放),
+   再做一次 query;loss 和记忆参数的梯度与官方代码走 autograd 的结果对比;不求梯度的 commit_memory
+   输出与官方文件逐位相同
+6. (--gpu)Nano 尺寸的单个记忆层(hidden 2048、16 头 x 256、BF16):三种方式的时间和显存峰值"""
 
 import argparse
 import os
@@ -26,7 +26,7 @@ sys.path.insert(0, ROOT)
 
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen  # noqa: E402
 
-# modeling_memt.py targets transformers 5.12.1; this env has 5.20 (same shims as the 9-5 benchmark runner).
+# modeling_memt.py 针对 transformers 5.12.1;当前环境是 5.20(与跑 benchmark 时用的兼容补丁相同)。
 for _name, _value in {
     "torch_causal_conv1d_update": qwen.causal_conv1d_update,
     "chunk_gated_delta_rule": None,
@@ -72,7 +72,7 @@ def test_gated_norm():
                 new.weight.copy_(ref.weight)
             ref.to(dtype), new.to(dtype)
             value = (torch.randn(2, 5, 3, 16) * 3).to(dtype)
-            gate = (torch.randn(2, 5, 3, 16) * 4).to(dtype)  # silu up to ~12: the cap at 2 is active
+            gate = (torch.randn(2, 5, 3, 16) * 4).to(dtype)  # silu 最大约 12:上限 2 会生效
             probe = torch.randn(2, 5, 3, 16)
             outs, grads = [], []
             for module in (ref, new):
@@ -130,7 +130,7 @@ def test_delta_rule_gradcheck():
                 lambda s, k, w, g: ma.BlockWriteFn.apply(s, k, w, g, block, every), inputs, eps=1e-6, atol=1e-7
             )
             check(f"gradcheck block writer ({path}) block={block} every={every}", ok)
-    # FP32 accuracy of the scaled path at its threshold (every channel just below the largest accepted decay)
+    # 快公式在阈值处的 FP32 精度(每个通道都略低于允许的最大衰减)
     state32 = torch.randn(1, heads, kdim, vdim, dtype=torch.float64)
     key32 = torch.randn(1, 512, heads, kdim, dtype=torch.float64)
     key32 = 0.9 * key32 / key32.norm(dim=-1, keepdim=True)
@@ -149,9 +149,9 @@ def memory_pair(hidden_size, heads, dim, bias, softcap, dtype, every, seed=3, wr
     torch.manual_seed(seed)
     ref = O.MemTMemory(cfg, hidden_size, heads, dim)
     with torch.no_grad():
-        for p in ref.parameters():  # move away from the near-zero init so every path carries signal
+        for p in ref.parameters():  # 离开接近零的初始值,让每条路径都有信号
             p.add_(torch.randn_like(p) * 0.3)
-        ref.decay_bias.normal_()  # decays between ~0.3 and ~1 instead of ~0.9999
+        ref.decay_bias.normal_()  # 衰减在约 0.3 到 1 之间,而不是约 0.9999
     new = M.MemTMemory(cfg, hidden_size, heads, dim)
     new.load_state_dict(ref.state_dict())
     new.checkpoint_every, new.writer, new.write_block = every, writer, block
@@ -193,7 +193,7 @@ def test_memory(dtype, tol, cases, writer):
         if writer == "token" or u_ref is None:
             same = torch.equal(r_ref, r_new) and (u_ref is None or torch.equal(u_ref, u_new))
             check(f"forward bitwise  {tag}", same)
-        else:  # reads bitwise; the block writer agrees with the token loop to FP32 rounding
+        else:  # 读出逐位相同;block 写入与逐 token 循环相差 FP32 舍入量级
             check(f"read bitwise     {tag}", torch.equal(r_ref, r_new))
             check_rel(f"written state    {tag}", u_new, u_ref, 1e-5)
         worst = max((rel(g_new[k], g_ref[k]), k) for k in g_ref if g_ref[k] is not None)
@@ -230,10 +230,10 @@ def tiny_config():
 def build(module, config, chunk, every):
     torch.manual_seed(5)
     model = module.MemTQwen3_5MoeForCausalLM(config).float().eval()
-    for layer in model.model.language_model.layers:  # 5.20 decoder forward reads block_type
+    for layer in model.model.language_model.layers:  # 5.20 的 decoder forward 会读取 block_type
         if not hasattr(layer, "block_type"):
             layer.block_type = layer.layer_type
-    model.config.memt["chunk_tokens"] = chunk  # several write chunks in a short test
+    model.config.memt["chunk_tokens"] = chunk  # 短测试里也有多个写入 chunk
     for name, p in model.named_parameters():
         p.requires_grad_(".memt." in name)
     for layer in model.model.language_model.layers:
@@ -242,7 +242,7 @@ def build(module, config, chunk, every):
             layer.self_attn.memt.write_block = 3
             with torch.no_grad():
                 layer.self_attn.memt.decay_bias.normal_()
-                layer.self_attn.memt.g_down.weight.mul_(8)  # larger reads so the query depends on memory
+                layer.self_attn.memt.g_down.weight.mul_(8)  # 放大读出,让 query 依赖记忆
     return model
 
 
@@ -276,7 +276,7 @@ def test_end_to_end():
             tag = f"{writer} writer, " + ("document + QA-event replay" if replay else "document")
             if writer == "token":
                 check(f"loss bitwise ({tag})", torch.equal(loss_ref, loss_new), f"{loss_new.item():.6f}")
-            else:  # the block writer agrees with the token loop to FP32 rounding
+            else:  # block 写入与逐 token 循环相差 FP32 舍入量级
                 check_rel(f"loss ({tag})", loss_new, loss_ref, 1e-6)
             nonzero = sum(int(g.abs().max() > 0) for g in g_ref.values())
             worst = max((rel(g_new[k], g_ref[k]), k) for k in g_ref)
@@ -317,7 +317,7 @@ def test_gpu_nano_layer(length, with_autograd=True):
     probes = (torch.randn(1, length, 4096, device=device), torch.randn(1, 16, 256, 256, device=device))
     runs = [("block", block), ("token", token)] + ([("autograd", ref)] if with_autograd else [])
     short = (x[:, :64], (probes[0][:, :64], probes[1]))
-    for _, module in runs:  # warm-up (CUDA context, cuBLAS) before timing
+    for _, module in runs:  # 计时前先预热(CUDA 上下文、cuBLAS)
         run_memory(module, short[0], state, None, True, short[1])
         for p in module.parameters():
             p.grad = None
@@ -367,8 +367,8 @@ def main():
     test_gated_norm()
     test_delta_rule_gradcheck()
     import itertools
-    # (commit, state, write_state, bias, softcap); without commit a state is needed (else the read is a constant
-    # zero) and write_state is unused
+    # (commit, state, write_state, bias, softcap);不写入时必须有 state(否则读出恒为零),
+    # 且用不到 write_state
     full = [c for c in itertools.product((False, True), repeat=5) if c[0] or (c[1] and not c[2])]
     for writer in ("block", "token"):
         test_memory(torch.float32, 1e-4, full, writer)

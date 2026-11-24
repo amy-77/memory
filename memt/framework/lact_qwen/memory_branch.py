@@ -19,7 +19,7 @@ def inv_softplus(x: float) -> float:
 
 
 def memt_l2_norm(x: torch.Tensor) -> torch.Tensor:
-    """MemT-1.0-Nano's normalisation (MemTMemory._normalize): x * rsqrt(sum(x^2) + 1e-6), in FP32."""
+    """MemT-1.0-Nano 的归一化(MemTMemory._normalize):x * rsqrt(sum(x^2) + 1e-6),在 FP32 下计算。"""
     x = x.float()
     return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)
 
@@ -101,21 +101,20 @@ class MemoryConfig:
     forget_rank: int = 64
     forget_halflife_min: float = 2048.0
     forget_halflife_max: float = 32768.0
-    # ---- MemT-1.0 alignment (core == 'matrix'). The defaults keep the behaviour the 4B run
-    # (step_2160) was trained with; MemT-1.0-Nano uses the values in brackets.
-    # Upper bound of the per-token decay -lam; None = no bound. [None]
+    # ---- 与 MemT-1.0 对齐(core == 'matrix')。默认值保持 4B(step_2160)训练时的行为;
+    # 方括号里是 MemT-1.0-Nano 的取值。
+    # 每个 token 的衰减 -lam 的上限;None 表示没有上限。[None]
     decay_cap: Optional[float] = MAX_DECAY
-    # Write algorithm, all the same recurrence: "scaled" = delta_write (1 / P_i trick, needs decay_cap),
-    # "stable" = delta_write_stable (only decay ratios <= 1, any decay, ~9x slower), "auto" = delta_write_auto
-    # (scaled form for blocks whose total decay is small, stable form otherwise; any decay). ["auto"]
+    # 写入算法,计算的都是同一个递推:"scaled" = delta_write(1 / P_i 技巧,需要 decay_cap);
+    # "stable" = delta_write_stable(只用到 <= 1 的衰减比,任意衰减都可以,慢约 9 倍);
+    # "auto" = delta_write_auto(总衰减小的块用快公式,其余用稳定公式;任意衰减都可以)。["auto"]
     write_impl: str = "scaled"
-    # eps of the RMSNorm on the memory read. [1e-6, the backbone's rms_norm_eps]
+    # 记忆读出上 RMSNorm 的 eps。[1e-6,即 backbone 的 rms_norm_eps]
     out_norm_eps: float = 1e-5
-    # q / k normalisation: "lact" x / (|x| + 1e-5), "memt" x * rsqrt(sum(x^2) + 1e-6). ["memt"]
+    # q / k 的归一化:"lact" 为 x / (|x| + 1e-5),"memt" 为 x * rsqrt(sum(x^2) + 1e-6)。["memt"]
     qk_norm: str = "lact"
-    # Round the normalised q / k, sqrt(erase gate), the combined key u, the write gate and the read to the
-    # projection dtype (BF16 under autocast) as MemT-1.0-Nano's code does; states, decay and norms stay
-    # FP32 either way. [True]
+    # 把归一化后的 q / k、sqrt(擦除门)、合成的键 u、写入门和读出舍入到投影的数据类型
+    # (autocast 下为 BF16),与 MemT-1.0-Nano 的代码一致;状态、衰减和归一化始终是 FP32。[True]
     memt_rounding: bool = False
     replay: ReplayConfig = field(default_factory=ReplayConfig)
 
@@ -342,8 +341,8 @@ class LaCTMemoryBranch(nn.Module):
 
     @torch.no_grad()
     def _auto_plan(self, x: torch.Tensor, segments, flags) -> dict:
-        """write_impl='auto': which write blocks of every written segment can use the scaled form, decided for
-        the whole sequence with one GPU -> host sync (instead of one per segment). Returns {segment: [bool]}."""
+        """write_impl='auto':每个要写入的段里,哪些写入块可以用快公式。对整条序列一次判断完,
+        只做一次 GPU -> CPU 同步(而不是每段一次)。返回 {段序号: [bool]}。"""
         cfg = self.cfg
         h, d = cfg.num_heads, cfg.head_dim
         decay = F.softplus(self.forget_up(self.forget_down(x)).float())
@@ -369,8 +368,8 @@ class LaCTMemoryBranch(nn.Module):
         kv = F.linear(x, self.qkv.weight[h * d :])
         if cfg.qkv_act == "silu":
             kv = F.silu(kv)
-        proj_dtype = kv.dtype  # BF16 under autocast
-        # memt_rounding: round to the projection dtype like MemT-1.0-Nano (no-op when it is FP32)
+        proj_dtype = kv.dtype  # autocast 下为 BF16
+        # memt_rounding:像 MemT-1.0-Nano 那样舍入到投影的数据类型(本身是 FP32 时不起作用)
         rnd = (lambda t: t.to(proj_dtype).float()) if cfg.memt_rounding else (lambda t: t)
         k, v = rearrange(kv.float(), "b l (n h d) -> n (b h) l d", n=2, h=h, d=d)
         erase_logits = self.erase_proj(x).float()
@@ -401,7 +400,7 @@ class LaCTMemoryBranch(nn.Module):
         proj_dtype = q.dtype
         q = rearrange(q.float(), "b l (h d) -> (b h) l d", h=h, d=d)
         q = memt_l2_norm(q) if self.cfg.qk_norm == "memt" else l2_norm(q)
-        if self.cfg.memt_rounding:  # MemT rounds q_hat when the step is also written (always the case here)
+        if self.cfg.memt_rounding:  # MemT 在这一步同时要写入时会舍入 q_hat(这里总是如此)
             q = q.to(proj_dtype).float()
 
         ctx = self.ctx
@@ -465,7 +464,7 @@ class LaCTMemoryBranch(nn.Module):
         b, length, _ = x.shape
         h, d = self.cfg.num_heads, self.cfg.head_dim
         out = self._read_matrix(x) if self.matrix else self._read_mlp(x)
-        if self.cfg.memt_rounding:  # MemT casts the FP32 read to the activation dtype before its RMSNorm
+        if self.cfg.memt_rounding:  # MemT 在 RMSNorm 之前把 FP32 的读出转成激活的数据类型
             dev = x.device.type
             act_dtype = torch.get_autocast_dtype(dev) if torch.is_autocast_enabled(dev) else x.dtype
             out = out.to(act_dtype)

@@ -1,4 +1,4 @@
-"""MemT-1.0 alignment of the matrix memory: stable block write without a decay bound, MemT norms."""
+"""矩阵记忆与 MemT-1.0 的对齐:没有衰减上限的稳定分块写入、MemT 的归一化。"""
 
 import copy
 import json
@@ -43,7 +43,7 @@ def test_stable_write_fp32_close_to_fp64_reference():
 
 
 def test_scaled_write_needs_the_decay_cap():
-    # why the old path clamps the decay: 1 / P_i overflows inside a 256-token block
+    # 旧写法为什么要截断衰减:1 / P_i 在 256-token 的块内会溢出
     start, u, z, lam = (t.float() for t in inputs(length=256, decay=2.0))
     ref = delta_write_reference(start.double(), u.double(), z.double(), lam.double())
     old = delta_write(start, u, z, lam, 256)
@@ -52,7 +52,7 @@ def test_scaled_write_needs_the_decay_cap():
 
 
 def mixed_decay_inputs(length=600, dtype=torch.float64):
-    # blocks of 256 tokens: small decays (fast path), then one channel with large decays (stable path), then small
+    # 每块 256 个 token:先是小衰减(快公式),然后一个通道衰减很大(稳定公式),再回到小衰减
     start, u, z, lam = inputs(length=length, decay=1e-3, dtype=dtype)
     lam[:, 256:300, 3] = -2.0
     return start, u, z, lam
@@ -69,7 +69,7 @@ def test_auto_write_equals_token_by_token(decay):
 
 
 def test_auto_fast_path_fp32_accuracy_at_its_threshold():
-    # every channel of every block sits just below the threshold: the largest 1 / P_i the fast path accepts
+    # 每个块的每个通道都略低于阈值:快公式能接受的最大 1 / P_i
     start, u, z, lam = inputs(length=512, decay=0.0)
     lam[:] = -0.999 * AUTO_MAX_LOG_GROWTH / 256
     ref = delta_write_reference(start, u, z, lam)
@@ -112,7 +112,7 @@ def test_checkpoint_groups_do_not_change_gradients():
 
 def test_memt_l2_norm_is_nano_normalize():
     x = torch.randn(4, 7, 32, dtype=torch.bfloat16)
-    expected = x.float() * torch.rsqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)  # MemTMemory._normalize
+    expected = x.float() * torch.rsqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)  # 对应 MemTMemory._normalize
     torch.testing.assert_close(memt_l2_norm(x), expected, rtol=0, atol=0)
 
 
@@ -121,10 +121,10 @@ def test_defaults_are_the_trained_4b_settings():
     assert (cfg.decay_cap, cfg.write_impl, cfg.out_norm_eps, cfg.qk_norm, cfg.memt_rounding) == (
         MAX_DECAY, "scaled", 1e-5, "lact", False)
     with open(os.path.join(HERE, "..", "..", "train_run", "step_2160_memory_config.json")) as f:
-        old = MemoryConfig.from_dict(json.load(f)["memory"])  # written before these fields existed
+        old = MemoryConfig.from_dict(json.load(f)["memory"])  # 这份配置写于这些字段出现之前
     assert old.write_impl == "scaled" and old.decay_cap == MAX_DECAY
     with pytest.raises(ValueError):
-        MemoryConfig(decay_cap=None)  # the scaled write cannot run without the cap
+        MemoryConfig(decay_cap=None)  # 没有上限时不能用快公式写入
     with open(os.path.join(HERE, "..", "..", "train_run", "memt_aligned.json")) as f:
         aligned = MemoryConfig.from_dict(json.load(f)["memory"])
     assert (aligned.decay_cap, aligned.write_impl, aligned.out_norm_eps, aligned.qk_norm, aligned.memt_rounding) == (
@@ -156,7 +156,7 @@ def test_aligned_model_trains_with_large_decays():
     set_attention_window(base, 8, segment=8)
     model = build(base, decay_cap=None, write_impl="auto", out_norm_eps=1e-6, qk_norm="memt", memt_rounding=True)
     branch = model.model.layers[0].memory
-    with torch.no_grad():  # decays of 1-5 per token, far beyond the old cap of 0.03
+    with torch.no_grad():  # 每个 token 衰减 1-5,远超旧上限 0.03
         branch.forget_up.bias.fill_(3.0)
     freeze_base(model)
     ids = torch.randint(0, 97, (2, 40))
@@ -165,7 +165,7 @@ def test_aligned_model_trains_with_large_decays():
     assert torch.isfinite(logits).all()
     logits.float().sum().backward()
     for name, p in branch.named_parameters():
-        if name in ("forget_down.weight",):  # forget_up starts at zero, so its input factor has no gradient yet
+        if name in ("forget_down.weight",):  # forget_up 初始为零,所以它的输入因子此时还没有梯度
             continue
         assert p.grad is not None and torch.isfinite(p.grad).all(), name
     assert branch.forget_up.bias.grad.abs().sum() > 0
