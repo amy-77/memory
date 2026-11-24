@@ -22,6 +22,7 @@
 | `train_run/heldout_eval_summary.txt` | 各检查点在留出长文档上的损失 |
 | `locomo_eval/` | LoCoMo 评测脚本(MemT 和 LiveMem),见下文 |
 | `benchmark_eval/` | MemT-1.0 报告表 2 的 5 个记忆 benchmark 上的复现评测(4B、原版 Qwen3-4B、官方 MemT-1.0-Nano;结果、协议、代码),见 `benchmark_eval/README.md` |
+| `nano_backward/` | 官方 MemT-1.0-Nano 推理代码的训练补充:门控归一化(软上限)、记忆读写、注意力中记忆部分的手写 backward,`commit_memory_train`,与 autograd 的对比测试,见 `nano_backward/README.md` |
 
 ## 训练配方
 
