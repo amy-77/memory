@@ -156,12 +156,12 @@ class MemTMemory(nn.Module):
         result = value.float() * torch.rsqrt(value.float().square().sum(-1, keepdim=True) + 1e-6)
         return result.to(value.dtype) if rounded else result
 
-    # 训练时的写入算法(memt_autograd):"block" = 分块 WY 形式,每 `checkpoint_every` 个 token 一组,
-    # 组内总衰减小时用快公式,否则用稳定公式(每 `write_block` 个 token 一次求解);
+    # 训练时的写入算法(memt_autograd):"block" = 分块 WY 形式,每 `write_block` 个 token 一块(必须是 2 的幂),
+    # 块内只有矩阵乘和一次三角求解,衰减多大都稳定;每块开始时存一份 FP32 状态,反向时从它重算。
     # "token" = 官方的逐 token 循环,配逐 token 反向。两者计算的是同一个递推。
     writer = "block"
-    write_block = 64
-    # 保存 FP32 写入状态的间隔(token 数);反向时每次重算这样一组。
+    write_block = 256
+    # "token" 算法保存 FP32 写入状态的间隔(token 数);反向时每次重算这样一组。
     checkpoint_every = 256
 
     def memory_config(self):

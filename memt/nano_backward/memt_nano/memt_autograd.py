@@ -7,10 +7,9 @@
    更新后的状态交给 ``memory_call.results``;传入的读/写状态可能在另一张卡上,它们的梯度会送回那张卡。
 3. ``MemTMemoryFn``(以及 ``memory_forward`` / ``memory_backward``):对应 ``MemTMemory.forward``(第 92-132 行),
    包括带 sqrt 擦除门的 delta 规则写入。两种写入算法计算的是同一个递推:
-   - ``writer="block"``(默认):分块 WY 形式(MemT 训练时的做法,见报告第 4 节)。每 ``ckpt_every`` 个 token 一组:
-     组内总衰减小时用快公式一次求解;否则用稳定公式,每 64 个 token 做一次矩阵乘法加三角求解,
-     只出现衰减比 exp(G_t - G_s) <= 1,衰减多大都可以。前向保存每组开始时的 FP32 状态;
-     反向从存档重算这一组,组内用 autograd 求导。
+   - ``writer="block"``(默认):分块 WY 形式(MemT 报告 4.2 节)。每 ``block`` 个 token 一块,块内只有矩阵乘和
+     一次三角求解;衰减因子都写成"不超过 1 的两个因子相乘",所以衰减多大都不会溢出,不需要衰减上限。
+     前向保存每块开始时的 FP32 状态;反向从存档重算中间量,再用手写的块反向公式求梯度,不调用 autograd。
    - ``writer="token"``:官方的逐 token 循环,配手写的逐 token backward(保留作参照)。
 
 除写入算法外,前向的每一步运算都照抄官方代码(同样的类型转换、同样的顺序):读出与 modeling_memt.py 逐位相同;
@@ -26,10 +25,33 @@
     dL/du_t = G (w_t - P_t^T u_t) - P_t g
     dP    = G - u_t g^T
     dL/dd_t = rowsum(dP * S_{t-1})
-    dL/dS_{t-1} = diag(d_t) dP"""
+    dL/dS_{t-1} = diag(d_t) dP
+
+一个块(C 个 token)的分块 WY 形式。记 lam_t = log d_t,G_t = lam_1 + ... + lam_t(块内累加),U、Z 的第 t 行是 u_t、w_t:
+    L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)   (s < t,严格下三角)
+    Ut      = exp(G) * U                          (第 t 行乘 exp(G_t))
+    E       = (I + L)^-1 (Z - Ut S_0)             (三角求解;E 的第 t 行就是 w_t - P_t^T u_t)
+    W       = exp(G_C - G) * U
+    S_C     = exp(G_C) * S_0 + W^T E
+L 的算法(``wy_lower``):把块对半分,右半的 t 和左半的 s 之间取参考点 r(左半最后一个 token),
+    exp(G_t - G_s) = exp(G_t - G_r) * exp(G_r - G_s),两个因子都不超过 1,
+于是这一层的 L 子块 = (右半的 u * 第一个因子) 乘 (左半的 u * 第二个因子)^T,是普通矩阵乘;
+再对左右两半各自递归,共 log2(C) 层,每层对所有块、所有节点一次批量矩阵乘。
+一个块的反向,记 G' = dL/dS_C(K x V):
+    dE   = W G'                 dW = E G'^T
+    dR   = (I + L)^-T dE        (转置的三角求解)   -> dL/dZ = dR
+    dL_  = -dR E^T                                 (L 的梯度,只用严格下三角部分)
+    dUt  = -dR S_0^T
+    dL/dS_0 = exp(G_C) * G' - Ut^T dR
+    X[t] = sum_s dL_[t, s] exp(G_t - G_s) * u_s,   Y[s] = sum_t dL_[t, s] exp(G_t - G_s) * u_t
+           (``wy_lower_backward``:与 L 同样的分层,每层两次矩阵乘)
+    dL/dU   = X + Y + exp(G) * dUt + exp(G_C - G) * dW
+    dL/dG   = U * (X - Y) + Ut * dUt - W * dW,     最后一行再加 rowsum(G' * S_C)
+    dL/dlam_t = dL/dG_t + dL/dG_{t+1} + ... + dL/dG_C"""
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -46,9 +68,9 @@ class MemoryConfig:
     norm_eps: float
     softcap: bool
     limit: float
-    ckpt_every: int = 256  # 保存写入状态的间隔(token 数)
+    ckpt_every: int = 256  # token 算法保存写入状态的间隔(token 数)
     writer: str = "block"  # "block"(分块 WY)或 "token"(官方逐 token 循环,逐 token 反向)
-    block: int = 64  # block 算法里稳定公式每次三角求解的 token 数
+    block: int = 256  # block 算法的块长(2 的幂):每块一次三角求解,并存一份块起始状态
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -170,48 +192,83 @@ def delta_rule_backward(grad_state, checkpoints, key, write_value, decay, every)
     return grad, d_key, d_write, d_decay
 
 
-def delta_block_stable(state, u, z, lam):
-    """写入的一个块,分块 WY 形式,对任意 lam <= 0 都精确。
-    state [N, K, V];u, lam [N, C, K];z [N, C, V]。记 G = 块内 cumsum(lam):
-        L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)   (s < t)
-        (I + L) E = Z - (exp(G) * U) S_0
-        S_C = exp(G_C) * S_0 + (exp(G_C - G) * U)^T E
-    只对非正数取 exp(衰减比 <= 1)。"""
-    c = u.shape[1]
-    g = lam.cumsum(dim=1)
-    pair = g[:, :, None, :] - g[:, None, :, :]  # [N, t, s, K] = G_t - G_s
-    below = torch.ones(c, c, dtype=torch.bool, device=u.device).tril(-1)
-    pair = pair.masked_fill(~below[None, :, :, None], float("-inf"))
-    lower = torch.einsum("ntk,nsk,ntsk->nts", u, u, pair.exp())
-    rhs = z - (u * g.exp()) @ state
-    e = torch.linalg.solve_triangular(lower, rhs, upper=False, unitriangular=True)
-    last = g[:, -1:, :]
-    return state * last.transpose(1, 2).exp() + (u * (last - g).exp()).transpose(1, 2) @ e
+def _halves(size):
+    """块长 size(2 的幂)的各层半长:size / 2、size / 4、...、1。"""
+    half = size // 2
+    while half >= 1:
+        yield half
+        half //= 2
 
 
-def delta_block_scaled(state, u, z, lam):
-    """同一个块的快公式(带 1 / P_t 因子)。比稳定公式快约 9 倍,但 1 / P_t 会按 exp(块内总衰减) 增长,
-    所以只在总衰减不超过 FAST_MAX_LOG_GROWTH 时使用。"""
-    grow = torch.exp(-lam.cumsum(dim=1))  # 1 / P_t
-    a, b = u * grow, u / grow
-    lower = torch.tril(b @ a.transpose(1, 2), diagonal=-1)
-    e = torch.linalg.solve_triangular(lower, z - b @ state, upper=False, unitriangular=True)
-    return (state + a.transpose(1, 2) @ e) / grow[:, -1, :, None]
+def _level_operands(u, g):
+    """wy_lower 各层矩阵乘的操作数。u [M, C, K];g [M, C, K] 是块内 cumsum(lam)(FP64)。
+    半长为 half 的一层把块切成长 2 * half 的节点,参考点 r 取节点左半的最后一个 token。每层返回
+        right = 右半的 u * exp(G_t - G_r),   left = 左半的 u * exp(G_r - G_s),
+        f_right = exp(G_t - G_r),            f_left = exp(G_r - G_s),
+    形状都是 [M, 节点数, half, K]。两个指数都不超过 0;差在 FP64 下算,再转回 u 的精度。"""
+    m, c, k = u.shape
+    levels = []
+    for half in _halves(c):
+        uv = u.reshape(m, c // (2 * half), 2 * half, k)
+        gv = g.reshape(m, c // (2 * half), 2 * half, k)
+        ref = gv[:, :, half - 1 : half]
+        f_right = (gv[:, :, half:] - ref).to(u.dtype).exp()
+        f_left = (ref - gv[:, :, :half]).to(u.dtype).exp()
+        levels.append((uv[:, :, half:] * f_right, uv[:, :, :half] * f_left, f_right, f_left))
+    return levels
 
 
-# 快公式允许的一组内最大总衰减:1 / P_t <= exp(7.68) ~ 2200(每 token 0.03、共 256 个 token,
-# 即 4B 框架的快公式一直运行的范围;此范围内 FP32 误差低于 1e-4)。
-FAST_MAX_LOG_GROWTH = 0.03 * 256
+def _node_blocks(matrix, nodes, half):
+    """[M, C, C] 矩阵里各节点的"右半行 x 左半列"子块,作为视图返回,形状 [M, half, half, 节点数]。"""
+    m = matrix.shape[0]
+    return matrix.view(m, nodes, 2 * half, nodes, 2 * half).diagonal(dim1=1, dim2=3)[:, half:, :half]
 
 
-def _write_group(state, u, z, lam, block):
-    """一组 token(最多 `ckpt_every` 个):各通道总衰减都小时,用快公式一次求解;
-    否则用稳定公式,每 `block` 个 token 一块。两者都精确,没有任何截断。"""
-    if u.shape[1] <= 256 and float((-lam).sum(dim=1).amax()) <= FAST_MAX_LOG_GROWTH:
-        return delta_block_scaled(state, u, z, lam)
-    for s in range(0, u.shape[1], block):
-        state = delta_block_stable(state, u[:, s : s + block], z[:, s : s + block], lam[:, s : s + block])
-    return state
+def wy_lower(u, g, levels=None):
+    """L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)(s < t),其余为 0。
+    u [M, C, K];g [M, C, K] 是块内 cumsum(lam)(FP64);C 是 2 的幂。算法见模块开头"L 的算法"。"""
+    m, c, _ = u.shape
+    lower = u.new_zeros(m, c, c)
+    for right, left, _, _ in levels or _level_operands(u, g):
+        _node_blocks(lower, right.shape[1], right.shape[2])[:] = (right @ left.transpose(-1, -2)).permute(0, 2, 3, 1)
+    return lower
+
+
+def wy_lower_backward(d_lower, u, g, levels=None):
+    """wy_lower 的手写反向。d_lower [M, C, C] 是对 L 的梯度(只读严格下三角部分)。
+    返回 (X + Y, X - Y):L 对 u 的梯度是 X + Y,对 G 的梯度是 u * (X - Y)。"""
+    m, c, k = u.shape
+    x, y = torch.zeros_like(u), torch.zeros_like(u)  # 每层里,X 落在右半的行上,Y 落在左半的行上
+    for right, left, f_right, f_left in levels or _level_operands(u, g):
+        nodes, half = right.shape[1], right.shape[2]
+        d_piece = _node_blocks(d_lower, nodes, half).permute(0, 3, 1, 2)  # [M, 节点数, half, half]
+        x.view(m, nodes, 2 * half, k)[:, :, half:] += (d_piece @ left) * f_right
+        y.view(m, nodes, 2 * half, k)[:, :, :half] += (d_piece.transpose(-1, -2) @ right) * f_left
+    return x + y, x - y
+
+
+def _block_size(length, block):
+    """实际块长:不超过 block、且够装下 length 的最小的 2 的幂(block 本身必须是 2 的幂)。"""
+    assert block >= 1 and block & (block - 1) == 0, f"write block must be a power of two, got {block}"
+    size = 1
+    while size < min(block, length):
+        size *= 2
+    return size
+
+
+def _wy_terms(u, z, lam, size):
+    """把序列切成长 size 的块(末尾补零:u = 0、z = 0、lam = 0 的 token 不改变状态)。
+    返回每块的量,第一维 M = N * 块数:u、z、块内累加的 log 衰减 G(FP64)、
+    exp(G_t)、exp(G_C - G_t)、exp(G_C)。三个指数都不超过 1。"""
+    k = u.shape[-1]
+    pad = (-u.shape[1]) % size
+    if pad:
+        u, z, lam = (F.pad(t, (0, 0, 0, pad)) for t in (u, z, lam))
+    ub = u.reshape(-1, size, k)
+    zb = z.reshape(-1, size, z.shape[-1])
+    g = lam.reshape(-1, size, k).double().cumsum(1)
+    last = g[:, -1:]
+    return ub, zb, g, g.to(u.dtype).exp(), (last - g).to(u.dtype).exp(), last.squeeze(1).to(u.dtype).exp()
 
 
 def _heads_first(t):
@@ -220,58 +277,98 @@ def _heads_first(t):
     return t.permute(0, 2, 1, 3).reshape(b * h, length, d)
 
 
-def block_write_forward(state, key, write_value, lam, block, every):
-    """state [B, H, K, V];key, lam [B, L, H, K];write_value [B, L, H, V](FP32)。
-    返回最终状态 [B, H, K, V],以及进入第 0、every、2 * every、... 个 token 时的状态 [B * H, K, V]。"""
-    b, h = state.shape[:2]
-    u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
-    s = state.reshape(b * h, *state.shape[2:])
-    checkpoints = []
-    for start in range(0, u.shape[1], every):
-        checkpoints.append(s)
-        s = _write_group(s, u[:, start : start + every], z[:, start : start + every], g[:, start : start + every], block)
-    return s.reshape(state.shape), checkpoints
+def _fp32_region(fn):
+    """让函数在关闭 autocast 的环境下运行:里面的矩阵乘和三角求解必须保持 FP32,不能被 autocast 降到 BF16。"""
+
+    @functools.wraps(fn)
+    def wrapper(first, *args, **kwargs):
+        with torch.autocast(device_type=first.device.type, enabled=False):
+            return fn(first, *args, **kwargs)
+
+    return wrapper
 
 
-def block_write_backward(grad_state, checkpoints, key, write_value, lam, block, every):
-    """block_write_forward 的梯度:d state、d key、d write_value、d lam。每组 `every` 个 token
-    从保存的状态重算,组内用 autograd 求导(MemT 报告:"reconstructing intermediate quantities
-    during backward")。"""
+@_fp32_region
+def block_write_forward(state, key, write_value, lam, block):
+    """分块 WY 写入。state [B, H, K, V];key、lam [B, L, H, K];write_value [B, L, H, V](FP32)。
+    返回最终状态 [B, H, K, V],以及每块开始时的状态 [B * H, K, V](反向用的存档)。"""
+    u, z, lm = _heads_first(key), _heads_first(write_value), _heads_first(lam)
+    n, length, k = u.shape
+    size = _block_size(length, block)
+    ub, zb, g, head, tail, keep = _wy_terms(u, z, lm, size)
+    count = ub.shape[0] // n
+    # 下面四个量不依赖状态,所有块一起算
+    lower = wy_lower(ub, g).view(n, count, size, size)
+    scaled_u, w = (ub * head).view(n, count, size, k), (ub * tail).view(n, count, size, k)
+    zb, keep = zb.view(n, count, size, -1), keep.view(n, count, k)
+    s = state.reshape(n, *state.shape[2:])
+    starts = []
+    for i in range(count):  # 只有这一步依赖状态,必须按块依次做
+        starts.append(s)
+        e = torch.linalg.solve_triangular(lower[:, i], zb[:, i] - scaled_u[:, i] @ s, upper=False, unitriangular=True)
+        s = s * keep[:, i, :, None] + w[:, i].transpose(1, 2) @ e
+    return s.reshape(state.shape), starts
+
+
+@_fp32_region
+def block_write_backward(grad_state, starts, key, write_value, lam, block):
+    """block_write_forward 的手写反向:返回 d state、d key、d write_value、d lam。
+    中间量(L、E 等)从存档的块起始状态重算,全程不调用 autograd
+    (MemT 报告 4.2 节:"reconstructing intermediate quantities during backward")。"""
     b, length, h, _ = key.shape
-    u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
-    d_u, d_z, d_g = torch.zeros_like(u), torch.zeros_like(z), torch.zeros_like(g)
-    grad = grad_state.reshape(b * h, *grad_state.shape[2:])
-    for index in reversed(range(len(checkpoints))):
-        start, stop = index * every, min(length, (index + 1) * every)
-        with torch.enable_grad():
-            inputs = [t.detach().requires_grad_() for t in
-                      (checkpoints[index], u[:, start:stop], z[:, start:stop], g[:, start:stop])]
-            out = _write_group(*inputs, block)
-            grad, d_u[:, start:stop], d_z[:, start:stop], d_g[:, start:stop] = torch.autograd.grad(
-                out, inputs, grad
-            )
+    u, z, lm = _heads_first(key), _heads_first(write_value), _heads_first(lam)
+    n, k = u.shape[0], u.shape[-1]
+    size = _block_size(length, block)
+    ub, zb, g, head, tail, keep = _wy_terms(u, z, lm, size)  # 第一维 M = N * 块数
+    count = ub.shape[0] // n
+    # ---- 重算前向的中间量:各块互不依赖(起始状态有存档),所有块一起算 ----
+    levels = _level_operands(ub, g)
+    lower = wy_lower(ub, g, levels)
+    scaled_u, w = ub * head, ub * tail
+    start = torch.stack(starts, 1).reshape(n * count, *starts[0].shape[1:])  # [M, K, V]
+    e = torch.linalg.solve_triangular(lower, zb - scaled_u @ start, upper=False, unitriangular=True)  # [M, C, V]
+    # ---- 状态的梯度沿块往回传:只有这一步必须依次做 ----
+    upper = lower.transpose(1, 2).reshape(n, count, size, size)
+    w_blocks, scaled_blocks = w.view(n, count, size, k), scaled_u.view(n, count, size, k)
+    keep_blocks = keep.view(n, count, k)
+    grads = torch.empty_like(start).view(n, count, *start.shape[1:])  # 每块末状态的梯度 G'
+    d_rhs = torch.empty_like(zb).view(n, count, size, -1)
+    grad = grad_state.reshape(n, *grad_state.shape[2:])
+    for i in reversed(range(count)):
+        grads[:, i] = grad
+        d_rhs[:, i] = torch.linalg.solve_triangular(upper[:, i], w_blocks[:, i] @ grad, upper=True, unitriangular=True)
+        grad = grad * keep_blocks[:, i, :, None] - scaled_blocks[:, i].transpose(1, 2) @ d_rhs[:, i]
+    # ---- 其余梯度:各块互不依赖,所有块一起算 ----
+    grads, d_rhs = grads.view(n * count, *start.shape[1:]), d_rhs.view(n * count, size, -1)
+    d_w = e @ grads.transpose(1, 2)
+    d_scaled_u = -(d_rhs @ start.transpose(1, 2))
+    plus, minus = wy_lower_backward(-(d_rhs @ e.transpose(1, 2)), ub, g, levels)
+    d_u = plus + d_scaled_u * head + d_w * tail
+    d_cum = ub * (minus + d_scaled_u * head - d_w * tail)  # dL/dG_t
+    d_cum[:, -1] += (grads * start).sum(-1) * keep + (d_w * w).sum(1)  # rowsum(G' * S_C)
+    d_lam = d_cum.flip(1).cumsum(1).flip(1)
 
-    def back(t, width):  # [B * H, L, D] -> [B, L, H, D]
-        return t.reshape(b, h, length, width).permute(0, 2, 1, 3)
+    def back(t):  # [N * 块数, size, D] -> [B, L, H, D]
+        return t.reshape(b, h, count * size, t.shape[-1])[:, :, :length].permute(0, 2, 1, 3)
 
-    return grad.reshape(grad_state.shape), back(d_u, u.shape[-1]), back(d_z, z.shape[-1]), back(d_g, g.shape[-1])
+    return grad.reshape(grad_state.shape), back(d_u), back(d_rhs), back(d_lam)
 
 
 class BlockWriteFn(torch.autograd.Function):
     """只包含 block 写入(测试用;MemTMemoryFn 调用的是同一组函数)。"""
 
     @staticmethod
-    def forward(ctx, state, key, write_value, lam, block, every):
-        final, checkpoints = block_write_forward(state, key, write_value, lam, block, every)
-        ctx.args = (block, every)
-        ctx.save_for_backward(key, write_value, lam, *checkpoints)
+    def forward(ctx, state, key, write_value, lam, block):
+        final, starts = block_write_forward(state, key, write_value, lam, block)
+        ctx.block = block
+        ctx.save_for_backward(key, write_value, lam, *starts)
         return final
 
     @staticmethod
     def backward(ctx, grad):
-        key, write_value, lam, *checkpoints = ctx.saved_tensors
-        d_state, d_key, d_write, d_lam = block_write_backward(grad, checkpoints, key, write_value, lam, *ctx.args)
-        return d_state, d_key, d_write, d_lam, None, None
+        key, write_value, lam, *starts = ctx.saved_tensors
+        d_state, d_key, d_write, d_lam = block_write_backward(grad, starts, key, write_value, lam, ctx.block)
+        return d_state, d_key, d_write, d_lam, None
 
 
 class DeltaRuleFn(torch.autograd.Function):
@@ -341,42 +438,66 @@ def memory_forward(hidden, params, snapshot, write_state, commit, cfg, with_chec
     decay = log_decay.exp()  # 与官方表达式的运算相同
     start = snapshot.float() if write_state is None else write_state.float()
     if with_checkpoints and cfg.writer == "block":
-        updated, checkpoints = block_write_forward(start, key, write_value, log_decay, cfg.block, cfg.ckpt_every)
+        updated, checkpoints = block_write_forward(start, key, write_value, log_decay, cfg.block)
         return read, updated, checkpoints
-    if with_checkpoints:
-        updated, checkpoints = delta_rule_forward(start, key, write_value, decay, cfg.ckpt_every)
-        return read, updated, checkpoints
-    updated = start
-    for index in range(length):
-        updated = delta_rule_step(updated, key[:, index], write_value[:, index], decay[:, index])
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        if with_checkpoints:
+            updated, checkpoints = delta_rule_forward(start, key, write_value, decay, cfg.ckpt_every)
+            return read, updated, checkpoints
+        updated = start
+        for index in range(length):
+            updated = delta_rule_step(updated, key[:, index], write_value[:, index], decay[:, index])
     return read, updated, None
+
+
+# in_proj 反向的两次大矩阵乘(d in_proj = d_rows^T x,d hidden = d_rows in_proj)用什么精度算。
+# None:与前向做这次线性变换时相同(BF16 模型就是 BF16,与 autograd 相同;累加仍在 FP32 下进行),整层反向最快。
+# torch.float32:在 FP32 下算,2048 个 token 的 Nano 层要多花约 10 ms。其余梯度始终在 FP32 下算。
+PROJECTION_BACKWARD_DTYPE = None
 
 
 def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_state, checkpoints, commit, cfg):
     """memory_forward 的梯度。grad_read / grad_updated 可以是 None(该输出没被用到)。
     返回 d_hidden、d_params(顺序同 params)、d_snapshot、d_write_state。"""
+    in_w, f_w = params[0], params[1]
+    dim, width = cfg.head_dim, cfg.num_heads * cfg.head_dim
+    # 先重算前向里的线性变换。它们要在与前向相同的 autocast 状态下算,才能得到与前向相同的值。
+    projected = F.linear(hidden, in_w[: 3 * width if commit else width])
+    gate_in = F.linear(hidden, in_w[-dim:])
+    gate = F.linear(gate_in, params[2], params[3])
+    gates = F.linear(hidden, in_w[3 * width : -dim]) if commit else None  # b、w、f
+    decay_in = F.linear(gates[..., 2 * width :], f_w) if commit else None
+    # 其余运算都显式指定了精度:关闭 autocast,避免 FP32 的矩阵乘被自动降到 BF16。
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        return _memory_backward(
+            grad_read, grad_updated, hidden, params, snapshot, write_state, checkpoints, commit, cfg,
+            projected, gate_in, gate, gates, decay_in,
+        )
+
+
+def _memory_backward(
+    grad_read, grad_updated, hidden, params, snapshot, write_state, checkpoints, commit, cfg,
+    projected, gate_in, gate, gates, decay_in,
+):
+    """memory_backward 的主体。最后五个参数是已经重算好的线性变换输出。"""
     in_w, f_w, g_w, g_b, decay_bias, decay_scale_log, norm_w = params
     batch, length, _ = hidden.shape
     heads, dim = cfg.num_heads, cfg.head_dim
     width = heads * dim
     shape = (batch, length, heads, dim)
     flat = (batch, length, width)
-    x = hidden.float()
     snap = snapshot.float()
+    gate = gate.reshape(shape)
 
-    # ---- 重算前向的各个量(投影很便宜;状态取自存档) ----
-    projected = F.linear(hidden, in_w[: 3 * width if commit else width])
+    # ---- 重算前向的其余量(状态取自存档) ----
     q_raw = projected[..., :width].reshape(shape).float()
     q_rstd = torch.rsqrt(q_raw.square().sum(-1, keepdim=True) + _L2_EPS)
     q_hat = q_raw * q_rstd
     q_used = q_hat.to(projected.dtype).float() if commit else q_hat
-    gate_in = F.linear(hidden, in_w[-dim:])
-    gate = F.linear(gate_in, g_w, g_b).reshape(shape)
 
     # ---- 读路径:read = o_norm(scale * q_hat S_snapshot, gate) ----
     if grad_read is not None:
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
-            read_raw = cfg.read_scale * torch.einsum("blhk,bhkv->blhv", q_used, snap)
+        read_raw = cfg.read_scale * torch.einsum("blhk,bhkv->blhv", q_used, snap)
         d_read_raw, d_gate, d_norm_w = _gated_rmsnorm_grads(
             grad_read.reshape(shape), read_raw.to(gate.dtype), gate, norm_w, cfg.norm_eps, cfg.softcap, cfg.limit
         )
@@ -389,19 +510,22 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         d_gate_in = d_gate @ g_w.float()
     else:  # 读出没被用到:只属于读路径的参数梯度为 None,与 autograd 一致
         d_snapshot = torch.zeros_like(snap)
-        d_q = x.new_zeros(flat)
+        d_q = snap.new_zeros(flat)
         d_norm_w = d_g_w = d_g_b = None
-        d_gate_in = x.new_zeros(batch, length, dim)
+        d_gate_in = snap.new_zeros(batch, length, dim)
 
     d_f_w = d_decay_bias = d_scale_log = None  # 只在写入时用到的参数:不写入时梯度为 None
     d_write_state = None
-    x_2d = x.reshape(-1, x.shape[-1])
+    # in_proj 的反向是整层最大的两次矩阵乘,精度见 PROJECTION_BACKWARD_DTYPE 的说明
+    mm_dtype = PROJECTION_BACKWARD_DTYPE or projected.dtype
+    x_2d = hidden.reshape(-1, hidden.shape[-1]).to(mm_dtype)
     if not commit:
         # 只用到了 in_proj 的 q 行和 g 行
-        d_in_w = torch.zeros(in_w.shape, dtype=torch.float32, device=in_w.device)
-        d_in_w[:width] = d_q.reshape(-1, width).t() @ x_2d
-        d_in_w[-dim:] = d_gate_in.reshape(-1, dim).t() @ x_2d
-        d_hidden = d_q @ in_w[:width].float() + d_gate_in @ in_w[-dim:].float()
+        d_q_mm, d_gate_in_mm = d_q.to(mm_dtype), d_gate_in.to(mm_dtype)
+        d_in_w = torch.zeros(in_w.shape, dtype=mm_dtype, device=in_w.device)
+        d_in_w[:width] = d_q_mm.reshape(-1, width).t() @ x_2d
+        d_in_w[-dim:] = d_gate_in_mm.reshape(-1, dim).t() @ x_2d
+        d_hidden = d_q_mm @ in_w[:width].to(mm_dtype) + d_gate_in_mm @ in_w[-dim:].to(mm_dtype)
     else:
         # ---- 写路径 ----
         k_raw = projected[..., width : 2 * width].reshape(shape)
@@ -409,14 +533,14 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         k_rstd = torch.rsqrt(k_raw.float().square().sum(-1, keepdim=True) + _L2_EPS)
         k_hat = k_raw.float() * k_rstd
         k_used = k_hat.to(k_raw.dtype).float()
-        b, w, f = F.linear(hidden, in_w[3 * width : -dim]).split((width, width, dim), -1)
+        b, w, f = gates.split((width, width, dim), -1)
         b32 = b.float()
         sqrt_b = (0.5 * F.logsigmoid(b32)).exp()
         sqrt_b_used = sqrt_b.to(b.dtype).float().reshape(shape)
         u = (k_used * sqrt_b_used).to(value.dtype).float()
         sig_w = w.sigmoid().reshape(shape).float()
         write_value = sig_w * value.float()
-        z = F.linear(f, f_w).float() + decay_bias.float()
+        z = decay_in.float() + decay_bias.float()
         softplus_z = F.softplus(z)
         scale = decay_scale_log.float().exp().reshape(heads, 1)
         log_decay = -scale * softplus_z.reshape(shape)
@@ -430,7 +554,7 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
             d_exponent = torch.zeros_like(decay)
         elif cfg.writer == "block":
             d_start, d_u, d_wv, d_exponent = block_write_backward(
-                grad_updated.float(), checkpoints, u, write_value, log_decay, cfg.block, cfg.ckpt_every
+                grad_updated.float(), checkpoints, u, write_value, log_decay, cfg.block
             )
         else:
             d_start, d_u, d_wv, d_decay = delta_rule_backward(
@@ -456,9 +580,9 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         else:
             d_write_state = d_start
         # ---- in_proj:行 = [q, k, v, b, w, f, g] ----
-        d_rows = torch.cat([d_q, d_k, d_v, d_b, d_w, d_f, d_gate_in], -1)
+        d_rows = torch.cat([d_q, d_k, d_v, d_b, d_w, d_f, d_gate_in], -1).to(mm_dtype)
         d_in_w = d_rows.reshape(-1, d_rows.shape[-1]).t() @ x_2d
-        d_hidden = d_rows @ in_w.float()
+        d_hidden = d_rows @ in_w.to(mm_dtype)
 
     def cast(grad, like):
         return None if grad is None or like is None else grad.to(like.dtype)
