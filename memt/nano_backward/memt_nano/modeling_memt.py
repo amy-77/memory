@@ -156,8 +156,12 @@ class MemTMemory(nn.Module):
         result = value.float() * torch.rsqrt(value.float().square().sum(-1, keepdim=True) + 1e-6)
         return result.to(value.dtype) if rounded else result
 
-    # Tokens between saved FP32 states in the write loop; backward recomputes one block at a time.
-    checkpoint_every = 64
+    # Training-time writer (memt_autograd): "block" = stable chunked WY form solved per `write_block` tokens,
+    # "token" = the released token loop with a per-token backward. Both compute the same recurrence.
+    writer = "block"
+    write_block = 64
+    # Tokens between saved FP32 write states; backward recomputes one such group at a time.
+    checkpoint_every = 256
 
     def memory_config(self):
         return MemoryConfig(
@@ -168,6 +172,8 @@ class MemTMemory(nn.Module):
             softcap=self.o_norm.softcap,
             limit=self.o_norm.limit,
             ckpt_every=self.checkpoint_every,
+            writer=self.writer,
+            block=self.write_block,
         )
 
     def memory_params(self):

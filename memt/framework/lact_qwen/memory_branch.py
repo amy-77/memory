@@ -10,12 +10,18 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .fast_weight import FastWeightState, UpdateConfig, fixed_segments, fw_apply, l2_norm, segmented_lact
-from .matrix_memory import MAX_DECAY, delta_write
+from .matrix_memory import AUTO_MAX_LOG_GROWTH, MAX_DECAY, delta_write, delta_write_auto, delta_write_stable
 from .replay import ReplayBank, ReplayConfig
 
 
 def inv_softplus(x: float) -> float:
     return x + math.log(-math.expm1(-x))
+
+
+def memt_l2_norm(x: torch.Tensor) -> torch.Tensor:
+    """MemT-1.0-Nano's normalisation (MemTMemory._normalize): x * rsqrt(sum(x^2) + 1e-6), in FP32."""
+    x = x.float()
+    return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)
 
 
 @dataclass
@@ -95,7 +101,31 @@ class MemoryConfig:
     forget_rank: int = 64
     forget_halflife_min: float = 2048.0
     forget_halflife_max: float = 32768.0
+    # ---- MemT-1.0 alignment (core == 'matrix'). The defaults keep the behaviour the 4B run
+    # (step_2160) was trained with; MemT-1.0-Nano uses the values in brackets.
+    # Upper bound of the per-token decay -lam; None = no bound. [None]
+    decay_cap: Optional[float] = MAX_DECAY
+    # Write algorithm, all the same recurrence: "scaled" = delta_write (1 / P_i trick, needs decay_cap),
+    # "stable" = delta_write_stable (only decay ratios <= 1, any decay, ~9x slower), "auto" = delta_write_auto
+    # (scaled form for blocks whose total decay is small, stable form otherwise; any decay). ["auto"]
+    write_impl: str = "scaled"
+    # eps of the RMSNorm on the memory read. [1e-6, the backbone's rms_norm_eps]
+    out_norm_eps: float = 1e-5
+    # q / k normalisation: "lact" x / (|x| + 1e-5), "memt" x * rsqrt(sum(x^2) + 1e-6). ["memt"]
+    qk_norm: str = "lact"
+    # Round the normalised q / k, sqrt(erase gate), the combined key u, the write gate and the read to the
+    # projection dtype (BF16 under autocast) as MemT-1.0-Nano's code does; states, decay and norms stay
+    # FP32 either way. [True]
+    memt_rounding: bool = False
     replay: ReplayConfig = field(default_factory=ReplayConfig)
+
+    def __post_init__(self):
+        if self.write_impl not in ("scaled", "stable", "auto"):
+            raise ValueError("write_impl must be 'scaled', 'stable' or 'auto'")
+        if self.qk_norm not in ("lact", "memt"):
+            raise ValueError("qk_norm must be 'lact' or 'memt'")
+        if self.write_impl == "scaled" and (self.decay_cap is None or self.decay_cap > MAX_DECAY):
+            raise ValueError(f"write_impl='scaled' needs decay_cap <= {MAX_DECAY}; use write_impl='stable'")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -185,7 +215,7 @@ class LaCTMemoryBranch(nn.Module):
         else:
             self._init_mlp(hidden_size, dh)
 
-        self.out_norm = nn.RMSNorm(d, eps=1e-5)
+        self.out_norm = nn.RMSNorm(d, eps=cfg.out_norm_eps)
         self._init_output(hidden_size)
         nn.init.normal_(self.qkv.weight, std=0.02)
 
@@ -310,23 +340,56 @@ class LaCTMemoryBranch(nn.Module):
             raise ValueError(f"segments end at {ctx.segments[-1][1]} but sequence has {length} tokens")
         return ctx.segments, ctx.update_flags
 
-    def _matrix_write(self, state: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def _auto_plan(self, x: torch.Tensor, segments, flags) -> dict:
+        """write_impl='auto': which write blocks of every written segment can use the scaled form, decided for
+        the whole sequence with one GPU -> host sync (instead of one per segment). Returns {segment: [bool]}."""
+        cfg = self.cfg
+        h, d = cfg.num_heads, cfg.head_dim
+        decay = F.softplus(self.forget_up(self.forget_down(x)).float())
+        decay = decay.view(*decay.shape[:2], h, d) * self.forget_scale.float().exp()[:, None]
+        if cfg.decay_cap is not None:
+            decay = decay.clamp(max=cfg.decay_cap)
+        totals, owner = [], []
+        for i, ((s, e), do_update) in enumerate(zip(segments, flags)):
+            if do_update:
+                for start in range(s, e, cfg.write_block):
+                    totals.append(decay[:, start : min(e, start + cfg.write_block)].sum(dim=1).amax())
+                    owner.append(i)
+        plan = {}
+        if totals:
+            for i, ok in zip(owner, (torch.stack(totals) <= AUTO_MAX_LOG_GROWTH).tolist()):
+                plan.setdefault(i, []).append(ok)
+        return plan
+
+    def _matrix_write(self, state: torch.Tensor, x: torch.Tensor, safe=None) -> torch.Tensor:
         """Write the tokens x [b, l, hidden] into state [b * h, d, d]."""
         h, d = self.cfg.num_heads, self.cfg.head_dim
+        cfg = self.cfg
         kv = F.linear(x, self.qkv.weight[h * d :])
-        if self.cfg.qkv_act == "silu":
+        if cfg.qkv_act == "silu":
             kv = F.silu(kv)
+        proj_dtype = kv.dtype  # BF16 under autocast
+        # memt_rounding: round to the projection dtype like MemT-1.0-Nano (no-op when it is FP32)
+        rnd = (lambda t: t.to(proj_dtype).float()) if cfg.memt_rounding else (lambda t: t)
         k, v = rearrange(kv.float(), "b l (n h d) -> n (b h) l d", n=2, h=h, d=d)
         erase_logits = self.erase_proj(x).float()
-        erase = (torch.exp(0.5 * F.logsigmoid(erase_logits)) if self.cfg.stable_matrix_gates
+        erase = (torch.exp(0.5 * F.logsigmoid(erase_logits)) if cfg.stable_matrix_gates
                  else torch.sigmoid(erase_logits).sqrt())
-        write = torch.sigmoid(self.write_proj(x).float())
+        write_logits = self.write_proj(x)
+        write = write_logits.sigmoid().float() if cfg.memt_rounding else torch.sigmoid(write_logits.float())
         decay = F.softplus(self.forget_up(self.forget_down(x)).float())
         decay = decay.view(*decay.shape[:2], h, d) * self.forget_scale.float().exp()[:, None]
         erase, write, decay = (rearrange(t, "b l (h d) -> (b h) l d", h=h, d=d) for t in (erase, write, decay.flatten(2)))
         with torch.autocast(device_type=x.device.type, enabled=False):
-            u = erase * l2_norm(k)
-            return delta_write(state, u, write * v, -decay.clamp(max=MAX_DECAY), self.cfg.write_block)
+            k_hat = memt_l2_norm(k) if cfg.qk_norm == "memt" else l2_norm(k)
+            u = rnd(rnd(k_hat) * rnd(erase))
+            lam = -decay if cfg.decay_cap is None else -decay.clamp(max=cfg.decay_cap)
+            if cfg.write_impl == "stable":
+                return delta_write_stable(state, u, write * v, lam)
+            if cfg.write_impl == "auto":
+                return delta_write_auto(state, u, write * v, lam, cfg.write_block, safe=safe)
+            return delta_write(state, u, write * v, lam, cfg.write_block)
 
     def _read_matrix(self, x: torch.Tensor) -> torch.Tensor:
         """Chunk by chunk: read the state left by the earlier chunks, then write this chunk into it."""
@@ -335,7 +398,11 @@ class LaCTMemoryBranch(nn.Module):
         q = F.linear(x, self.qkv.weight[: h * d])
         if self.cfg.qkv_act == "silu":
             q = F.silu(q)
-        q = l2_norm(rearrange(q.float(), "b l (h d) -> (b h) l d", h=h, d=d))
+        proj_dtype = q.dtype
+        q = rearrange(q.float(), "b l (h d) -> (b h) l d", h=h, d=d)
+        q = memt_l2_norm(q) if self.cfg.qk_norm == "memt" else l2_norm(q)
+        if self.cfg.memt_rounding:  # MemT rounds q_hat when the step is also written (always the case here)
+            q = q.to(proj_dtype).float()
 
         ctx = self.ctx
         segments, flags = self._segments(length)
@@ -343,11 +410,12 @@ class LaCTMemoryBranch(nn.Module):
         if state is None:
             state = torch.zeros(b * h, d, d, device=x.device, dtype=torch.float32)
         outputs = []
-        for (s, e), do_update in zip(segments, flags):
+        plan = self._auto_plan(x, segments, flags) if self.cfg.write_impl == "auto" else {}
+        for i, ((s, e), do_update) in enumerate(zip(segments, flags)):
             with torch.autocast(device_type=x.device.type, enabled=False):
                 outputs.append(q[:, s:e] @ state / math.sqrt(d))
             if do_update:
-                state = self._matrix_write(state, x[:, s:e])
+                state = self._matrix_write(state, x[:, s:e], plan.get(i))
         if ctx.session:
             ctx.states[self.layer_idx] = state.detach()
         return torch.cat(outputs, dim=1)
@@ -397,6 +465,10 @@ class LaCTMemoryBranch(nn.Module):
         b, length, _ = x.shape
         h, d = self.cfg.num_heads, self.cfg.head_dim
         out = self._read_matrix(x) if self.matrix else self._read_mlp(x)
+        if self.cfg.memt_rounding:  # MemT casts the FP32 read to the activation dtype before its RMSNorm
+            dev = x.device.type
+            act_dtype = torch.get_autocast_dtype(dev) if torch.is_autocast_enabled(dev) else x.dtype
+            out = out.to(act_dtype)
 
         out = self.out_norm(out.float())
         out = rearrange(out, "(b h) l d -> b l h d", b=b, h=h)

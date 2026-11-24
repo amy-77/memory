@@ -1,4 +1,4 @@
-# MemT-1.0-Nano 记忆分支的手写 backward(Step 1)
+# MemT-1.0-Nano 记忆分支的手写 backward
 
 官方 `MemTensor/MemT-1.0-Nano` 的 `modeling_memt.py`(Apache-2.0)只支持推理。这里给记忆分支补上训练所需的 backward。
 来源和许可证见 `THIRD_PARTY_NOTICES.md`。
@@ -19,23 +19,31 @@
 |---|---|---|
 | 1. 带软上限的门控 RMSNorm 的 backward | 44–52 行(`MemTRMSNormGated`,上限在 51 行) | `GatedRMSNormFn`、`gated_rmsnorm_backward`:RMS 归一化、SiLU、tanh 上限的导数全部手写 |
 | 2. full attention 中记忆部分的 backward | 257–266 行(`MemTAttention.forward`) | `MemoryResidualFn`:"注意力输出 + 记忆读出"和"更新后的状态"合成一个节点;读/写状态的梯度传回它们原来所在的设备 |
-| 3. 记忆的 backward | 92–132 行(`MemTMemory.forward`) | `MemTMemoryFn`、`memory_forward`、`memory_backward`、`delta_rule_backward`:读、写两条路径都手写 |
+| 3. 记忆的 backward | 92–132 行(`MemTMemory.forward`) | `MemTMemoryFn`、`memory_forward`、`memory_backward`:读、写两条路径的链式部分都手写;写入递推见下 |
 
-写入递推(每个 batch、每个头,S 为 K×V):
+写入递推(每个 batch、每个头,S 为 K×V;λ = log d ≤ 0 是按通道的 log 衰减):
 
-    P_t = diag(d_t) S_{t-1}
-    S_t = P_t + u_t (w_t − P_tᵀ u_t)ᵀ
+    S_t = D_t S_{t-1} + u_t (w_t − u_tᵀ D_t S_{t-1})ᵀ,   D_t = diag(exp λ_t)
 
-已知 G = ∂L/∂S_t 时:
+训练时有两种算法,算的是同一个递推,由 `MemTMemory.writer` 选择:
 
-    g = Gᵀ u_t                           → ∂L/∂w_t = g
-    ∂L/∂u_t = G (w_t − P_tᵀ u_t) − P_t g
-    dP = G − u_t gᵀ
-    ∂L/∂d_t = rowsum(dP ⊙ S_{t-1})
-    ∂L/∂S_{t-1} = diag(d_t) dP
+- **`"block"`(默认,2026-11-25 起)**:数值稳定的分块 WY 形式(`delta_block_stable`),对应 MemT 报告第 4 节训练时用的 "chunked WY"。
+  - 每 64 个 token 做一次矩阵乘法加一次三角求解。块内 G = cumsum(λ),只出现衰减比 exp(G_t − G_s)(s ≤ t,值 ≤ 1),所以衰减多大都不会溢出,也不需要上限。
 
-前向每 `MemTMemory.checkpoint_every`(= 64)个 token 存一份 FP32 状态。反向时一次只重算 64 个 token 的状态,再倒着走一遍。
-所以显存按 L/64 份状态增长,而直接 autograd 要为每个 token 存一份状态。
+        L[t,s] = Σ_k u_tk u_sk exp(G_tk − G_sk)  (s < t)
+        (I + L) E = Z − (exp(G) ⊙ U) S_0
+        S_C = exp(G_C) ⊙ S_0 + (exp(G_C − G) ⊙ U)ᵀ E
+
+  - 前向每 `MemTMemory.checkpoint_every`(= 256)个 token 存一份 FP32 状态。反向时从存档重算这一组,组内用 autograd 对 (状态, u, w, λ) 求导,再接回手写的链式部分。即报告里的 "reconstructing intermediate quantities during backward"。
+- **`"token"`**:官方的逐 token 循环,加手写的逐 token backward,保留作参照。每一步的反向公式(G = ∂L/∂S_t,P_t = D_t S_{t-1}):
+
+        g = Gᵀ u_t                           → ∂L/∂w_t = g
+        ∂L/∂u_t = G (w_t − P_tᵀ u_t) − P_t g
+        dP = G − u_t gᵀ
+        ∂L/∂d_t = rowsum(dP ⊙ S_{t-1})
+        ∂L/∂S_{t-1} = diag(d_t) dP
+
+读出不受写入算法影响,始终与官方逐位一致。写入后的状态:`token` 逐位一致;`block` 与官方差在 FP32 舍入量级(相对 ~1e-5)。
 
 `modeling_memt.py` 的改动(`diff memt_nano/modeling_memt_orig.py memt_nano/modeling_memt.py`):
 
@@ -50,25 +58,35 @@
 环境:torch 2.14、transformers 5.20.2。测试文件里带了 transformers 5.12 → 5.20 的两个兼容补丁。
 
 ```
-CUDA_VISIBLE_DEVICES="" python tests/test_backward.py          # CPU 检查 1–5
-python tests/test_backward.py --gpu [--length 2048]             # 加 6:Nano 尺寸单层的速度和显存
+CUDA_VISIBLE_DEVICES="" python tests/test_backward.py              # CPU 检查 1–5
+python tests/test_backward.py --gpu-only --length 512 2048          # 只跑 6:Nano 尺寸单层的速度和显存
 ```
 
-结果(2026-11-24,0 项失败):
+结果(2026-11-25,171 项,0 项失败):
 
 1. **门控归一化**:软上限开/关。forward 与官方逐位一致;梯度相对误差 FP32 ≤ 1e-6,BF16 约 5e-3。
-2. **写入递推**:FP64 `gradcheck`,checkpoint 间隔 1/4/11/20 都通过。
-3. **MemTMemory**:读/写、有无状态、有无 write_state、有无 bias、有无软上限,共 20 种组合。forward 逐位一致;梯度相对误差 FP32 ≤ 3e-7,BF16 ≤ 6e-3。
+2. **写入递推**:
+   - 逐 token 版本:FP64 `gradcheck` 通过。
+   - `block` 版本:在衰减尺度 0.001、0.5、5 下与逐 token 循环一致(FP64,1e-10);FP64 `gradcheck` 在 4 种块大小/存档间隔下通过。
+3. **MemTMemory**:读/写、有无状态、有无 write_state、有无 bias、有无软上限,共 20 种组合,`block` 和 `token` 两种写法都测了。
+   - 读出逐位一致;写入状态 `token` 逐位一致,`block` 相对误差 ≤ 1e-5。
+   - 梯度相对误差 FP32 ≤ 3e-7,BF16 ≤ 6e-3。
 4. **4 层小模型端到端**(2 层带记忆,backbone 冻结):多 chunk 写入(文档模式;文档 + QA 事件回放)后做 query。
-   - loss 与官方代码逐位一致。
-   - 12 个记忆参数梯度相对误差 ≤ 6e-7。
+   - `token`:loss 逐位一致。
+   - `block`:loss 相对误差为 0(在打印精度下)。
+   - 两种写法的 12 个记忆参数梯度相对误差都 ≤ 8e-7。
    - 不求梯度时 `commit_memory` 与官方文件逐位一致。
-5. **Nano 尺寸单层**(hidden 2048、16 头 × 256、BF16):
-   - 512 token:梯度与 autograd 相差约 3e-3;0.17 s、0.68 GiB,autograd 为 0.19 s、4.2 GiB。
-   - 2048 token:0.68 s、1.7 GiB。autograd 每层每个 token 约需 8 MB,一个 2K chunk 约 17 GiB。
-   - 这组计时是在一张有其他任务的卡上测的,只能作参考。
+5. **Nano 尺寸单层**(hidden 2048、16 头 × 256、BF16,单卡,一个 2K chunk 的前向 + 反向):
+
+   | 写入算法 | 2048 token | 512 token |
+   |---|---|---|
+   | `block` | 0.10 s,1.65 GiB | 0.03 s,0.97 GiB |
+   | `token` | 0.56 s,1.74 GiB | 0.14 s,0.69 GiB |
+   | 直接 autograd(参照) | 0.62 s,16.9 GiB | 0.14 s,4.2 GiB |
+
+   与 autograd 相比,读出逐位一致,梯度差约 3e-3(BF16 噪声量级)。
 
 ## 还没做
 
-- **速度**:写入递推及其反向是逐 token 的 PyTorch 循环,每个记忆层每 2K chunk 约 0.7 s。Nano 有 10 个记忆层,一个 chunk 约 7 s,正式训练需要融合或分块的 kernel。
+- **速度**:`block` 写入是纯 PyTorch,每个记忆层每 2K chunk 约 0.1 s(前向 + 反向)。融合 kernel(如 FLA 的 KDA:k = u、β = 1、v = ω⊙v、g = λ)还可以再快。
 - **显存**:跨多个 chunk 的 backbone 激活还没做梯度 checkpointing。
