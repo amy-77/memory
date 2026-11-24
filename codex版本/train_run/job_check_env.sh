@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One non-interactive command for a submitted job: build the venv (setup_env.sh) and run check_env.py.
-# Everything goes to stdout; the job exits 0 even when a check fails, so the log is always available.
+# 给提交式任务用的一条非交互命令:建好 venv(setup_env.sh),再运行 check_env.py。
+# 所有输出都打到标准输出;即使有检查失败,任务也以 0 退出,保证日志能拿到。
 #
-#   bash train_run/job_check_env.sh                 # GPU job
-#   bash train_run/job_check_env.sh --allow-cpu     # CPU-only job: image, packages and index access
+#   bash train_run/job_check_env.sh                 # GPU 任务
+#   bash train_run/job_check_env.sh --allow-cpu     # 纯 CPU 任务:只检查镜像、依赖包和包索引
 #
-# Environment: VENV (default: venv_memt next to train_run), PIP_INDEX_URL, WORK_DIR (writable directory for
-# compile caches and pip's cache; default: the directory holding the venv).
+# 环境变量:VENV(默认:train_run 上一级目录里的 venv_memt)、PIP_INDEX_URL、
+# WORK_DIR(可写目录,放编译缓存和 pip 缓存;默认:venv 所在的目录)。
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export VENV="${VENV:-$SCRIPT_DIR/../venv_memt}"
 WORK_DIR="${WORK_DIR:-$(dirname "$VENV")}"

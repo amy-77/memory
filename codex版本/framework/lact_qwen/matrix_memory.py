@@ -63,22 +63,21 @@ def delta_write(
 
 
 # ---------------------------------------------------------------------------------------------------
-# Stable block form (no bound on the decay). `delta_write` above multiplies by 1 / P_i, which grows
-# like exp(-sum lam) inside a block and needs MAX_DECAY. Here only ratios P_t / P_s with s <= t appear,
-# computed as exp(G_t - G_s) with G = cumsum(lam) (so every factor is <= 1). With G_t the cumulative
-# log-decay inside the block (inclusive of t) and S_0 the state entering the block:
+# 稳定的分块形式(衰减没有上限)。上面的 `delta_write` 要乘 1 / P_i,它在块内按 exp(-sum lam) 增长,
+# 所以需要 MAX_DECAY。这里只出现 s <= t 的比值 P_t / P_s,按 exp(G_t - G_s) 计算,其中 G = cumsum(lam),
+# 因此每个因子都 <= 1。记 G_t 为块内到第 t 个 token(含)的累积 log 衰减,S_0 为进入这一块时的状态:
 #
-#     L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)       (s < t, zero otherwise)
-#     (I + L) E = Z - (exp(G) * U) S_0                 (unit lower triangular solve)
+#     L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)       (s < t,其余为零)
+#     (I + L) E = Z - (exp(G) * U) S_0                 (单位下三角求解)
 #     S_C = exp(G_C) * S_0 + (exp(G_C - G) * U)^T E
 #
-# which is the per-token rule exactly (MemT-1.0 report, section 4: "chunked WY"). The pairwise
-# [C, C, dk] decay tensor bounds the block size; 64 keeps it small.
+# 这与逐 token 规则完全等价(MemT-1.0 报告第 4 节:"chunked WY")。两两衰减张量 [C, C, dk]
+# 限制了块的大小;取 64 可以让它保持较小。
 # ---------------------------------------------------------------------------------------------------
 
 
 def delta_block_stable(state: torch.Tensor, u: torch.Tensor, z: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
-    """One block of tokens. state [N, dk, dv]; u, lam [N, C, dk]; z [N, C, dv]; lam <= 0."""
+    """一个块的 token。state [N, dk, dv];u, lam [N, C, dk];z [N, C, dv];lam <= 0。"""
     c = u.shape[1]
     g = lam.cumsum(dim=1)
     pair = g[:, :, None, :] - g[:, None, :, :]  # [N, t, s, dk] = G_t - G_s
@@ -105,12 +104,11 @@ def delta_write_stable(
     block: int = 64,
     group: int = 256,
 ) -> torch.Tensor:
-    """Same result as `delta_write_reference` for any lam <= 0 (no MAX_DECAY needed).
+    """对任意 lam <= 0,结果与 `delta_write_reference` 相同(不需要 MAX_DECAY)。
 
     state: [B, dk, dv]   u, lam: [B, L, dk]   z: [B, L, dv]   (float32)
-    With autograd on, every `group` tokens are recomputed in backward (activation checkpointing), so
-    only the state entering each group is kept instead of the pairwise decay tensor of every block.
-    """
+    开着 autograd 时,每 `group` 个 token 在反向时重算(激活 checkpoint),
+    所以只保存进入每组时的状态,而不是每个块的两两衰减张量。"""
     track = torch.is_grad_enabled() and any(t.requires_grad for t in (state, u, z, lam))
     for s in range(0, u.shape[1], group):
         args = (state, u[:, s : s + group], z[:, s : s + group], lam[:, s : s + group])
@@ -121,8 +119,8 @@ def delta_write_stable(
     return state
 
 
-# Largest total decay of one 256-token block for which the scaled form is used in delta_write_auto. It is the
-# range the scaled form has always run in (MAX_DECAY per token over 256 tokens): 1 / P_i <= exp(7.68) ~ 2200.
+# delta_write_auto 里,256-token 的块使用快公式所允许的最大总衰减。这是快公式一直运行的范围
+# (每 token MAX_DECAY、共 256 个 token):1 / P_i <= exp(7.68) ~ 2200。
 AUTO_MAX_LOG_GROWTH = MAX_DECAY * 256
 
 
@@ -135,14 +133,14 @@ def delta_write_auto(
     max_log_growth: float = AUTO_MAX_LOG_GROWTH,
     safe: list | None = None,
 ) -> torch.Tensor:
-    """Exact for any lam <= 0, fast when decays are small. Each block of `block` tokens uses the scaled form
-    (`delta_write`, ~9x faster) if its total decay sum(-lam) stays within `max_log_growth` in every channel,
-    and the stable form otherwise. Both compute the same recurrence; nothing is clipped.
-    `safe` (one bool per block) skips the GPU -> host check; a wrong plan only changes speed or overflows the
-    scaled form, so it must come from the same lam (see LaCTMemoryBranch._auto_plan)."""
+    """对任意 lam <= 0 都精确,衰减小时速度快。每 `block` 个 token 一块:若各通道的总衰减 sum(-lam)
+    都不超过 `max_log_growth`,用快公式(`delta_write`,快约 9 倍),否则用稳定公式。
+    两者计算的是同一个递推,没有任何截断。
+    `safe`(每块一个布尔值)可以跳过 GPU -> CPU 的判断;错误的计划只会改变速度,或让快公式溢出,
+    所以它必须由同一个 lam 算出(见 LaCTMemoryBranch._auto_plan)。"""
     length = u.shape[1]
     starts = list(range(0, length, block))
-    if safe is None:  # one host sync for this call; callers that write many steps pass a precomputed plan
+    if safe is None:  # 这次调用做一次 GPU -> CPU 同步;要写很多段的调用方会传入预先算好的计划
         with torch.no_grad():
             totals = [(-lam[:, s : s + block]).sum(dim=1).amax() for s in starts]
             safe = (torch.stack(totals) <= max_log_growth).tolist()
