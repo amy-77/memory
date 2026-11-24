@@ -133,15 +133,21 @@ def delta_write_auto(
     lam: torch.Tensor,
     block: int = 256,
     max_log_growth: float = AUTO_MAX_LOG_GROWTH,
+    safe: list | None = None,
 ) -> torch.Tensor:
     """Exact for any lam <= 0, fast when decays are small. Each block of `block` tokens uses the scaled form
     (`delta_write`, ~9x faster) if its total decay sum(-lam) stays within `max_log_growth` in every channel,
-    and the stable form otherwise. Both compute the same recurrence; nothing is clipped."""
+    and the stable form otherwise. Both compute the same recurrence; nothing is clipped.
+    `safe` (one bool per block) skips the GPU -> host check; a wrong plan only changes speed or overflows the
+    scaled form, so it must come from the same lam (see LaCTMemoryBranch._auto_plan)."""
     length = u.shape[1]
     starts = list(range(0, length, block))
-    with torch.no_grad():  # one host sync for all blocks
-        totals = [(-lam[:, s : s + block]).sum(dim=1).amax() for s in starts]
-        safe = (torch.stack(totals) <= max_log_growth).tolist()
+    if safe is None:  # one host sync for this call; callers that write many steps pass a precomputed plan
+        with torch.no_grad():
+            totals = [(-lam[:, s : s + block]).sum(dim=1).amax() for s in starts]
+            safe = (torch.stack(totals) <= max_log_growth).tolist()
+    if len(safe) != len(starts):
+        raise ValueError(f"plan has {len(safe)} blocks, the write has {len(starts)}")
     for s, ok in zip(starts, safe):
         args = (state, u[:, s : s + block], z[:, s : s + block], lam[:, s : s + block])
         state = delta_write(*args, block) if ok else delta_write_stable(*args)

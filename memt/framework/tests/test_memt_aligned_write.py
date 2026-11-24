@@ -169,3 +169,25 @@ def test_aligned_model_trains_with_large_decays():
             continue
         assert p.grad is not None and torch.isfinite(p.grad).all(), name
     assert branch.forget_up.bias.grad.abs().sum() > 0
+
+
+def test_auto_plan_matches_per_call_check():
+    start, u, z, lam = mixed_decay_inputs()
+    safe = [bool((-lam[:, s : s + 256]).sum(dim=1).amax() <= AUTO_MAX_LOG_GROWTH) for s in range(0, 600, 256)]
+    assert safe == [True, False, True]
+    torch.testing.assert_close(delta_write_auto(start, u, z, lam, safe=safe), delta_write_auto(start, u, z, lam),
+                               rtol=0, atol=0)
+    with pytest.raises(ValueError):
+        delta_write_auto(start, u, z, lam, safe=safe[:2])
+
+
+def test_model_auto_plan_is_one_decision_per_write_block():
+    base = tiny_qwen3()
+    set_attention_window(base, 8, segment=8)
+    model = build(base, decay_cap=None, write_impl="auto", write_block=4)
+    branch = model.model.layers[0].memory
+    x = torch.randn(2, 20, 64)
+    segments, flags = branch._segments(20)
+    plan = branch._auto_plan(x, segments, flags)
+    assert sorted(plan) == [i for i, f in enumerate(flags) if f]
+    assert all(len(plan[i]) == -(-(e - s) // 4) for i, (s, e) in enumerate(segments) if flags[i])

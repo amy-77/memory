@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .fast_weight import FastWeightState, UpdateConfig, fixed_segments, fw_apply, l2_norm, segmented_lact
-from .matrix_memory import MAX_DECAY, delta_write, delta_write_auto, delta_write_stable
+from .matrix_memory import AUTO_MAX_LOG_GROWTH, MAX_DECAY, delta_write, delta_write_auto, delta_write_stable
 from .replay import ReplayBank, ReplayConfig
 
 
@@ -340,7 +340,29 @@ class LaCTMemoryBranch(nn.Module):
             raise ValueError(f"segments end at {ctx.segments[-1][1]} but sequence has {length} tokens")
         return ctx.segments, ctx.update_flags
 
-    def _matrix_write(self, state: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    @torch.no_grad()
+    def _auto_plan(self, x: torch.Tensor, segments, flags) -> dict:
+        """write_impl='auto': which write blocks of every written segment can use the scaled form, decided for
+        the whole sequence with one GPU -> host sync (instead of one per segment). Returns {segment: [bool]}."""
+        cfg = self.cfg
+        h, d = cfg.num_heads, cfg.head_dim
+        decay = F.softplus(self.forget_up(self.forget_down(x)).float())
+        decay = decay.view(*decay.shape[:2], h, d) * self.forget_scale.float().exp()[:, None]
+        if cfg.decay_cap is not None:
+            decay = decay.clamp(max=cfg.decay_cap)
+        totals, owner = [], []
+        for i, ((s, e), do_update) in enumerate(zip(segments, flags)):
+            if do_update:
+                for start in range(s, e, cfg.write_block):
+                    totals.append(decay[:, start : min(e, start + cfg.write_block)].sum(dim=1).amax())
+                    owner.append(i)
+        plan = {}
+        if totals:
+            for i, ok in zip(owner, (torch.stack(totals) <= AUTO_MAX_LOG_GROWTH).tolist()):
+                plan.setdefault(i, []).append(ok)
+        return plan
+
+    def _matrix_write(self, state: torch.Tensor, x: torch.Tensor, safe=None) -> torch.Tensor:
         """Write the tokens x [b, l, hidden] into state [b * h, d, d]."""
         h, d = self.cfg.num_heads, self.cfg.head_dim
         cfg = self.cfg
@@ -366,7 +388,7 @@ class LaCTMemoryBranch(nn.Module):
             if cfg.write_impl == "stable":
                 return delta_write_stable(state, u, write * v, lam)
             if cfg.write_impl == "auto":
-                return delta_write_auto(state, u, write * v, lam, cfg.write_block)
+                return delta_write_auto(state, u, write * v, lam, cfg.write_block, safe=safe)
             return delta_write(state, u, write * v, lam, cfg.write_block)
 
     def _read_matrix(self, x: torch.Tensor) -> torch.Tensor:
@@ -388,11 +410,12 @@ class LaCTMemoryBranch(nn.Module):
         if state is None:
             state = torch.zeros(b * h, d, d, device=x.device, dtype=torch.float32)
         outputs = []
-        for (s, e), do_update in zip(segments, flags):
+        plan = self._auto_plan(x, segments, flags) if self.cfg.write_impl == "auto" else {}
+        for i, ((s, e), do_update) in enumerate(zip(segments, flags)):
             with torch.autocast(device_type=x.device.type, enabled=False):
                 outputs.append(q[:, s:e] @ state / math.sqrt(d))
             if do_update:
-                state = self._matrix_write(state, x[:, s:e])
+                state = self._matrix_write(state, x[:, s:e], plan.get(i))
         if ctx.session:
             ctx.states[self.layer_idx] = state.detach()
         return torch.cat(outputs, dim=1)
