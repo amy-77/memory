@@ -5,10 +5,15 @@ from typing import Optional
 
 import torch
 
+from .matrix_memory import MAX_DECAY
 from .memory_branch import MemoryConfig
 from .modeling import attach_memory, load_memory_config, load_memory_weights, set_attention_window, set_replay
 from .replay import REPLAY_MODES, ReplayConfig
 
+
+
+def _decay_cap(text):
+    return None if str(text).lower() == "none" else float(text)
 
 def add_model_args(p: argparse.ArgumentParser):
     g = p.add_argument_group("model")
@@ -48,6 +53,16 @@ def add_model_args(p: argparse.ArgumentParser):
     m.add_argument("--mem-stable-matrix-gates", action="store_true",
                    help="evaluate sqrt(sigmoid(erase_logits)) through log-sigmoid for finite extreme-logit gradients")
     m.add_argument("--mem-forget-rank", type=int, default=64, help="--mem-core matrix: width of the forget gate")
+    # MemT-1.0 alignment of the matrix memory (defaults = the archived 4B run; see MemoryConfig)
+    m.add_argument("--mem-decay-cap", type=_decay_cap, default=MAX_DECAY,
+                   help="bound on the per-token decay; 'none' = no bound (MemT-1.0)")
+    m.add_argument("--mem-write-impl", choices=["scaled", "stable", "auto"], default="scaled",
+                   help="matrix write algorithm (same recurrence); 'auto' or 'stable' are needed without a decay cap")
+    m.add_argument("--mem-out-norm-eps", type=float, default=1e-5, help="eps of the RMSNorm on the memory read")
+    m.add_argument("--mem-qk-norm", choices=["lact", "memt"], default="lact",
+                   help="q/k normalisation: x/(|x|+1e-5) or MemT's x*rsqrt(sum x^2 + 1e-6)")
+    m.add_argument("--mem-memt-rounding", action="store_true",
+                   help="round normalised q/k, sqrt(erase), u, write gate and read to the projection dtype as MemT-1.0-Nano")
     m.add_argument("--mem-layers", default="all", help="'all', 'every:N', or comma-separated indices")
     m.add_argument("--no-muon", action="store_true")
     m.add_argument("--mem-norm", default="post", choices=["post", "pre"], help="fast-weight write normalisation")
@@ -136,6 +151,11 @@ def memory_config_from_args(args) -> MemoryConfig:
         core=args.mem_core,
         write_block=args.mem_write_block,
         stable_matrix_gates=args.mem_stable_matrix_gates,
+        decay_cap=args.mem_decay_cap,
+        write_impl=args.mem_write_impl,
+        out_norm_eps=args.mem_out_norm_eps,
+        qk_norm=args.mem_qk_norm,
+        memt_rounding=args.mem_memt_rounding,
         forget_rank=args.mem_forget_rank,
         layers=args.mem_layers,
         norm=args.mem_norm,
