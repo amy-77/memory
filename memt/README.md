@@ -1,7 +1,7 @@
 # 4B MemT 风格记忆:训练代码与 LoCoMo 评测
 
 冻结的 Qwen3-4B 加每层一个矩阵记忆(门控 delta 规则,按 MemT-1.0 技术报告的公式实现)。
-这里的代码就是 h20-1 上实际训练用的那一份,没有改动。
+这里的代码就是 h20-1 上实际训练用的那一份。2026-11-25 加了与 MemT-1.0 对齐的配置开关,默认值保持原训练设置,见"与 MemT-1.0 对齐的开关"一节。
 
 ## 目录
 
@@ -44,6 +44,29 @@
 和官方 MemT-1.0 的差别:官方第一阶段 200 亿 token 交叉熵,第二阶段 140 亿 token 记忆任务数据加完整上下文教师的蒸馏;这里只做了第一阶段的约 1/9,第二阶段没做;实现是按报告公式自己写的,不是官方代码。
 
 启动命令见 `train_run/train_8gpu.sh` 最后的 `torch.distributed.run` 一行;续训用 `run_full.sh`(`--resume <检查点> --exact-text-resume`)。
+
+### 与 MemT-1.0 对齐的开关(2026-11-25,用于重训对齐版 4B)
+
+`MemoryConfig` 新增五个字段。默认值就是上面 4B 训练时的设置,所以旧检查点(包括 `step_2160`)的加载和结果都不变。
+`train_run/memt_aligned.json` 是打开全部对齐开关的配置(其余字段与 `memt.json` 相同)。
+
+| 字段 | 默认(旧 4B) | 对齐值(MemT-1.0-Nano) | 说明 |
+|---|---|---|---|
+| `decay_cap` | 0.03 | `None` | 每个 token 衰减的上限。MemT 没有上限;旧上限只是为了让下面的 `scaled` 写法不溢出 |
+| `write_impl` | `"scaled"` | `"auto"` | 写入的分块算法。三种算的是同一个递推,都没有截断:<br>• `scaled`:用 1/P 放大技巧,衰减大时会溢出,必须配合上限。<br>• `stable`(`delta_write_stable`):只计算衰减比 exp(G_t − G_s) ≤ 1,任何衰减都稳定,即报告第 4 节的 "chunked WY"。每 64 token 一次三角求解,开着 autograd 时每 256 token 做一次 checkpoint;纯 PyTorch 下比 `scaled` 慢约 9 倍。<br>• `auto`(`delta_write_auto`):每 256 token 一块,块内总衰减不超过 0.03×256 时用 `scaled`(就是旧 4B 一直在用的范围),否则这一块用 `stable` |
+| `out_norm_eps` | 1e-5 | 1e-6 | 读出后 RMSNorm 的 eps |
+| `qk_norm` | `"lact"`:x/(‖x‖+1e-5) | `"memt"`:x·rsqrt(Σx²+1e-6) | q/k 的归一化 |
+| `memt_rounding` | `False` | `True` | 把归一化后的 q/k、√β、u、写入门和读出先舍入到投影的精度(autocast 下为 BF16),与 Nano 代码一致。状态、衰减、归一化始终是 FP32 |
+
+测试:`framework/tests/test_memt_aligned_write.py`(34 项),内容包括:
+- `stable` 和 `auto` 在衰减 0.001 到 20 范围内(以及大小衰减混合时)与逐 token 定义一致(FP64,误差 1e-9)。
+- `auto` 的快路径正好落在阈值边界时,FP32 误差在 1e-4 以内。
+- 旧写法在大衰减下会坏。
+- gradcheck;分组 checkpoint 不改变梯度;`auto` 与 `stable` 的梯度一致。
+- 衰减未超过上限时,`scaled` 和 `stable` 在模型里的输出一致。
+- 对齐配置在大衰减下能正常训练。
+
+原有 25 项测试仍然全部通过。速度对比:`framework/scripts/bench_matrix_write.py`。
 
 ### 留出长文档上的损失(48 篇 32K 文档,每 token 交叉熵,越低越好)
 
