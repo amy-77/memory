@@ -96,6 +96,15 @@ softmax 注意力本身没有改:它走 PyTorch 内置的实现,前向和反向�
   在 import `modeling_memt` 之前调用 `memt_nano.compat.apply()`。它做两件事:补上官方文件需要、而 transformers 5.20 改了名字的几个函数;
   让 GDN 按张量所在设备选择实现(GPU 走 FLA,CPU 走纯 PyTorch。不这样做的话,transformers 5.20 在 CPU 上也会去调 FLA,报错)。
   FLA 的 kernel 由 Triton 编译,缓存默认在 `~/.triton/cache`;home 不可写或已满时设 `TRITON_CACHE_DIR`。
+
+  GDN 的核心运算(16 头 × 128、2048 token、BF16,H20):
+
+  | | 前向 | 前向 + 反向 | 显存峰值 |
+  |---|---|---|---|
+  | transformers 的纯 PyTorch 版 | 5.0 ms | 23.2 ms | 0.38 GiB |
+  | FLA 的 kernel | 0.6 ms | 2.0 ms | 0.16 GiB |
+
+  两者的输出相差 4.7e-3,即 BF16 的舍入量级(backbone 本来就是 BF16)。
 - **记忆写入没有用 FLA 的 kernel,原因是精度**。FLA 的 KDA(`fla.ops.kda.chunk_kda`)与这里的写入是同一个递推
   (传 k = u、β = 1、v = w、g = λ、取 `final_state`;它的逐 token 参考实现与官方循环逐位一致)。
   但它的 kernel 在支持 TF32 的显卡上用 TF32 做块内点积,写入后的状态和梯度的相对误差约 1e-3,这里的实现约 1e-7:
