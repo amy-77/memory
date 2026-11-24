@@ -2,6 +2,7 @@
 
     python scripts/check_env.py                 # everything, about a minute
     python scripts/check_env.py --no-network    # skip the package-index queries
+    python scripts/check_env.py --allow-cpu     # CPU-only job: image, packages and index only
 
 Prints one line per check and a JSON summary at the end; send the whole output back when something fails.
 Nothing is installed or changed. Compile caches go to TORCHINDUCTOR_CACHE_DIR / TMPDIR if set.
@@ -36,6 +37,7 @@ def version_of(module):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-network", action="store_true")
+    parser.add_argument("--allow-cpu", action="store_true", help="do not fail when no GPU is visible")
     args = parser.parse_args()
 
     record("python", sys.version_info >= (3, 10), f"{sys.version.split()[0]} on {platform.platform()}")
@@ -49,8 +51,10 @@ def main():
         record(name, "missing" not in found and (wanted is None or found == wanted), f"{found} (tested with {wanted})")
 
     cuda = torch.cuda.is_available()
-    record("cuda available", cuda, f"{torch.cuda.device_count()} device(s), CUDA_VISIBLE_DEVICES="
-           f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+    record("cuda available", cuda or args.allow_cpu,
+           f"{torch.cuda.device_count()} device(s), CUDA_VISIBLE_DEVICES="
+           f"{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+           + ("" if cuda else " -- GPU checks skipped" if args.allow_cpu else ""))
     if cuda:
         for index in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(index)

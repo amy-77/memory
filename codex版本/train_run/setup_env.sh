@@ -26,6 +26,7 @@ PY
 import datasets, einops, torch, transformers
 print("venv ok: torch", torch.__version__, "| transformers", transformers.__version__,
       "| datasets", datasets.__version__, "| einops", einops.__version__)
-assert torch.cuda.is_available() or print("WARNING: CUDA not available in this shell")
+if not torch.cuda.is_available():
+    print("note: no GPU visible in this shell (fine for a CPU-only check)")
 PY
 echo "next: source $VENV/bin/activate && python $SCRIPT_DIR/../framework/scripts/check_env.py"
