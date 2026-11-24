@@ -23,9 +23,35 @@
 - 损失:只有交叉熵。
 - 步数:4768。
 
+## 环境
+
+要求:torch ≥ 2.11 且 < 2.15,`transformers==5.20.2`,`datasets==5.1.0`,`einops`。
+
+在已经带 CUDA 版 PyTorch 的平台镜像上(例如 Python 3.12、torch 2.12.1+cu129),用 `train_run/setup_env.sh` 建环境:
+- 它创建一个继承镜像 torch 的 venv,只额外安装上面三个包,不改动镜像自带的 transformers / vLLM。
+- venv 默认建在 `codex版本/venv_memt`,可用 `VENV=` 指定位置。
+- pip 源可用 `PIP_INDEX_URL=` 指定。
+
+```bash
+bash codex版本/train_run/setup_env.sh
+source codex版本/venv_memt/bin/activate
+python codex版本/framework/scripts/check_env.py 2>&1 | tee check_env.log
+```
+
+`check_env.py` 不安装、不修改任何东西,约一分钟跑完。它检查:
+- 显卡数量和显存、torch 版本、NCCL。
+- BF16 autocast,`flex_attention` 分段 mask 的编译(第一次调用要编译 kernel)。
+- GPU 上的分块写入与逐 token 循环是否一致。
+- 编译缓存目录是否可写、剩余空间多少。
+- 是否已有 Megatron / Transformer Engine / flash_attn(只是信息,这份训练代码不需要)。
+- 包索引是否可访问(`--no-network` 跳过这项)。
+
+如果根目录或 `/tmp` 空间紧张,先把编译缓存指到有空间的目录:
+`export TMPDIR=... TORCHINDUCTOR_CACHE_DIR=... TRITON_CACHE_DIR=...`。在 h20-1 上曾因 `/tmp` 写满导致训练在第 2 步崩溃。
+
 ## 启动
 
-环境:`pip install -r codex版本/requirements.txt`(先装好与 CUDA 匹配的 PyTorch;另外需要 `flex_attention`,即 torch ≥ 2.5)。
+先按上一节建好环境并通过 `check_env.py`。`train_aligned.sh` 默认用当前 shell 里的 `python`,也可以用 `PYTHON=` 指定。
 
 单机 8 卡(梯度累积 4):
 
