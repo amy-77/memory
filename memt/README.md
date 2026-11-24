@@ -21,6 +21,7 @@
 | `train_run/step_2160_memory_config.json` | LoCoMo 评测所用检查点的完整配置(含全部训练参数) |
 | `train_run/heldout_eval_summary.txt` | 各检查点在留出长文档上的损失 |
 | `locomo_eval/` | LoCoMo 评测脚本(MemT 和 LiveMem),见下文 |
+| `benchmark_eval/` | MemT-1.0 报告表 2 的 5 个记忆 benchmark 上的复现评测(4B、原版 Qwen3-4B、官方 MemT-1.0-Nano;结果、协议、代码),见 `benchmark_eval/README.md` |
 
 ## 训练配方
 

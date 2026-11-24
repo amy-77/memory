@@ -16,6 +16,10 @@ Selective writing and replay for fixed-size external memories attached to a froz
 
 Status: research code in progress; results in `docs/` are preliminary.
 
+## Update 2026-11-24
+
+- `memt/benchmark_eval/`: the 4B MemT-style model, base Qwen3-4B and the official MemT-1.0-Nano on the five memory benchmarks of the MemT-1.0 report's Table 2 (LoCoMo, LongMemEval-S, PersonaMem-32K, MemoryAgentBench, BEAM-1M): results, protocol, code-vs-official comparison and the evaluation code (Chinese).
+
 ## Update 2026-11-22
 
 - `docs/LACT_SELECTIVE_WRITE.md`: turn-level selective writing on the LaCT memory (results, the two scores, commands, how to run on another checkpoint).

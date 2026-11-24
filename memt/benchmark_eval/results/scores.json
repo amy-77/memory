@@ -1,0 +1,1309 @@
+{
+ "beam_1m/nano/memory": {
+  "n": 700,
+  "total_in_files": 700,
+  "score": 29.8,
+  "per_category": {
+   "abstention": [
+    17.9,
+    70
+   ],
+   "contradiction_resolution": [
+    29.6,
+    70
+   ],
+   "event_ordering": [
+    13.8,
+    70
+   ],
+   "information_extraction": [
+    27.3,
+    70
+   ],
+   "instruction_following": [
+    52.9,
+    70
+   ],
+   "knowledge_update": [
+    5.7,
+    70
+   ],
+   "multi_session_reasoning": [
+    32.8,
+    70
+   ],
+   "preference_following": [
+    71.1,
+    70
+   ],
+   "summarization": [
+    38.4,
+    70
+   ],
+   "temporal_reasoning": [
+    8.8,
+    70
+   ]
+  }
+ },
+ "beam_1m/plain/full": {
+  "n": 700,
+  "total_in_files": 700,
+  "score": 18.4,
+  "per_category": {
+   "abstention": [
+    12.9,
+    70
+   ],
+   "contradiction_resolution": [
+    16.8,
+    70
+   ],
+   "event_ordering": [
+    4.1,
+    70
+   ],
+   "information_extraction": [
+    11.8,
+    70
+   ],
+   "instruction_following": [
+    45.5,
+    70
+   ],
+   "knowledge_update": [
+    7.9,
+    70
+   ],
+   "multi_session_reasoning": [
+    16.4,
+    70
+   ],
+   "preference_following": [
+    55.0,
+    70
+   ],
+   "summarization": [
+    6.6,
+    70
+   ],
+   "temporal_reasoning": [
+    6.9,
+    70
+   ]
+  }
+ },
+ "beam_1m/plain/memory": {
+  "n": 700,
+  "total_in_files": 700,
+  "score": 17.7,
+  "per_category": {
+   "abstention": [
+    27.9,
+    70
+   ],
+   "contradiction_resolution": [
+    17.9,
+    70
+   ],
+   "event_ordering": [
+    4.4,
+    70
+   ],
+   "information_extraction": [
+    7.0,
+    70
+   ],
+   "instruction_following": [
+    39.6,
+    70
+   ],
+   "knowledge_update": [
+    2.9,
+    70
+   ],
+   "multi_session_reasoning": [
+    10.0,
+    70
+   ],
+   "preference_following": [
+    53.8,
+    70
+   ],
+   "summarization": [
+    7.9,
+    70
+   ],
+   "temporal_reasoning": [
+    5.5,
+    70
+   ]
+  }
+ },
+ "beam_1m/plain/question": {
+  "n": 700,
+  "total_in_files": 700,
+  "score": 19.4,
+  "per_category": {
+   "abstention": [
+    10.0,
+    70
+   ],
+   "contradiction_resolution": [
+    21.8,
+    70
+   ],
+   "event_ordering": [
+    9.1,
+    70
+   ],
+   "information_extraction": [
+    10.9,
+    70
+   ],
+   "instruction_following": [
+    36.2,
+    70
+   ],
+   "knowledge_update": [
+    7.1,
+    70
+   ],
+   "multi_session_reasoning": [
+    15.6,
+    70
+   ],
+   "preference_following": [
+    58.8,
+    70
+   ],
+   "summarization": [
+    15.2,
+    70
+   ],
+   "temporal_reasoning": [
+    9.5,
+    70
+   ]
+  }
+ },
+ "beam_1m/plain/wrong": {
+  "n": 700,
+  "total_in_files": 700,
+  "score": 15.1,
+  "per_category": {
+   "abstention": [
+    19.3,
+    70
+   ],
+   "contradiction_resolution": [
+    18.4,
+    70
+   ],
+   "event_ordering": [
+    3.3,
+    70
+   ],
+   "information_extraction": [
+    3.2,
+    70
+   ],
+   "instruction_following": [
+    32.9,
+    70
+   ],
+   "knowledge_update": [
+    2.9,
+    70
+   ],
+   "multi_session_reasoning": [
+    10.1,
+    70
+   ],
+   "preference_following": [
+    47.9,
+    70
+   ],
+   "summarization": [
+    6.0,
+    70
+   ],
+   "temporal_reasoning": [
+    6.9,
+    70
+   ]
+  }
+ },
+ "locomo/chat/memory": {
+  "n": 382,
+  "total_in_files": 382,
+  "score": 0.0,
+  "per_category": {
+   "multi hop": [
+    0.0,
+    122
+   ],
+   "open domain": [
+    0.0,
+    39
+   ],
+   "temporal": [
+    0.0,
+    145
+   ],
+   "single hop": [
+    0.0,
+    76
+   ]
+  }
+ },
+ "locomo/chat/question": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 21.2,
+  "per_category": {
+   "temporal": [
+    6.9,
+    321
+   ],
+   "open domain": [
+    30.2,
+    96
+   ],
+   "multi hop": [
+    18.4,
+    282
+   ],
+   "single hop": [
+    26.6,
+    841
+   ]
+  }
+ },
+ "locomo/nano/memory": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 51.7,
+  "per_category": {
+   "temporal": [
+    16.5,
+    321
+   ],
+   "open domain": [
+    45.8,
+    96
+   ],
+   "multi hop": [
+    58.2,
+    282
+   ],
+   "single hop": [
+    63.6,
+    841
+   ]
+  }
+ },
+ "locomo/nano/question": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 2.7,
+  "per_category": {
+   "temporal": [
+    0.9,
+    321
+   ],
+   "open domain": [
+    12.5,
+    96
+   ],
+   "multi hop": [
+    3.2,
+    282
+   ],
+   "single hop": [
+    2.0,
+    841
+   ]
+  }
+ },
+ "locomo/plain/full": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 66.7,
+  "per_category": {
+   "temporal": [
+    26.8,
+    321
+   ],
+   "single hop": [
+    86.6,
+    841
+   ],
+   "multi hop": [
+    61.7,
+    282
+   ],
+   "open domain": [
+    40.6,
+    96
+   ]
+  }
+ },
+ "locomo/plain/memory": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 24.1,
+  "per_category": {
+   "temporal": [
+    6.5,
+    321
+   ],
+   "open domain": [
+    32.3,
+    96
+   ],
+   "multi hop": [
+    24.1,
+    282
+   ],
+   "single hop": [
+    29.8,
+    841
+   ]
+  }
+ },
+ "locomo/plain/question": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 18.8,
+  "per_category": {
+   "temporal": [
+    3.1,
+    321
+   ],
+   "single hop": [
+    23.9,
+    841
+   ],
+   "multi hop": [
+    16.7,
+    282
+   ],
+   "open domain": [
+    33.3,
+    96
+   ]
+  }
+ },
+ "locomo/plain/wrong": {
+  "n": 1540,
+  "total_in_files": 1540,
+  "score": 16.2,
+  "per_category": {
+   "temporal": [
+    6.2,
+    321
+   ],
+   "open domain": [
+    27.1,
+    96
+   ],
+   "multi hop": [
+    14.9,
+    282
+   ],
+   "single hop": [
+    19.3,
+    841
+   ]
+  }
+ },
+ "longmemeval_s/chat/memory": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 0.0,
+  "per_category": {
+   "single-session-user": [
+    0.0,
+    70
+   ],
+   "multi-session": [
+    0.0,
+    133
+   ],
+   "single-session-preference": [
+    0.0,
+    30
+   ],
+   "temporal-reasoning": [
+    0.0,
+    133
+   ],
+   "knowledge-update": [
+    0.0,
+    78
+   ],
+   "single-session-assistant": [
+    0.0,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/chat/question": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 8.0,
+  "per_category": {
+   "single-session-user": [
+    8.6,
+    70
+   ],
+   "multi-session": [
+    8.3,
+    133
+   ],
+   "single-session-preference": [
+    3.3,
+    30
+   ],
+   "temporal-reasoning": [
+    5.3,
+    133
+   ],
+   "knowledge-update": [
+    7.7,
+    78
+   ],
+   "single-session-assistant": [
+    16.1,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/nano/memory": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 29.0,
+  "per_category": {
+   "single-session-user": [
+    44.3,
+    70
+   ],
+   "multi-session": [
+    18.8,
+    133
+   ],
+   "single-session-preference": [
+    26.7,
+    30
+   ],
+   "temporal-reasoning": [
+    26.3,
+    133
+   ],
+   "knowledge-update": [
+    35.9,
+    78
+   ],
+   "single-session-assistant": [
+    32.1,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/nano/question": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 7.4,
+  "per_category": {
+   "single-session-user": [
+    7.1,
+    70
+   ],
+   "multi-session": [
+    7.5,
+    133
+   ],
+   "single-session-preference": [
+    0.0,
+    30
+   ],
+   "temporal-reasoning": [
+    5.3,
+    133
+   ],
+   "knowledge-update": [
+    6.4,
+    78
+   ],
+   "single-session-assistant": [
+    17.9,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/plain/full": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 27.2,
+  "per_category": {
+   "single-session-user": [
+    37.1,
+    70
+   ],
+   "multi-session": [
+    9.8,
+    133
+   ],
+   "single-session-preference": [
+    3.3,
+    30
+   ],
+   "temporal-reasoning": [
+    24.1,
+    133
+   ],
+   "knowledge-update": [
+    51.3,
+    78
+   ],
+   "single-session-assistant": [
+    42.9,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/plain/memory": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 9.2,
+  "per_category": {
+   "single-session-user": [
+    2.9,
+    70
+   ],
+   "multi-session": [
+    4.5,
+    133
+   ],
+   "single-session-preference": [
+    0.0,
+    30
+   ],
+   "temporal-reasoning": [
+    15.8,
+    133
+   ],
+   "knowledge-update": [
+    11.5,
+    78
+   ],
+   "single-session-assistant": [
+    14.3,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/plain/question": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 12.2,
+  "per_category": {
+   "single-session-user": [
+    15.7,
+    70
+   ],
+   "multi-session": [
+    7.5,
+    133
+   ],
+   "single-session-preference": [
+    6.7,
+    30
+   ],
+   "temporal-reasoning": [
+    14.3,
+    133
+   ],
+   "knowledge-update": [
+    12.8,
+    78
+   ],
+   "single-session-assistant": [
+    16.1,
+    56
+   ]
+  }
+ },
+ "longmemeval_s/plain/wrong": {
+  "n": 500,
+  "total_in_files": 500,
+  "score": 8.2,
+  "per_category": {
+   "single-session-user": [
+    4.3,
+    70
+   ],
+   "multi-session": [
+    4.5,
+    133
+   ],
+   "single-session-preference": [
+    0.0,
+    30
+   ],
+   "temporal-reasoning": [
+    11.3,
+    133
+   ],
+   "knowledge-update": [
+    7.7,
+    78
+   ],
+   "single-session-assistant": [
+    19.6,
+    56
+   ]
+  }
+ },
+ "mab/nano/memory": {
+  "n": 2071,
+  "score": 12.44,
+  "mab": {
+   "per_source": {
+    "detective_qa": {
+     "score": 0.0,
+     "n": 71,
+     "unscored": 0
+    },
+    "eventqa_full": {
+     "score": 58.2,
+     "n": 500,
+     "unscored": 0
+    },
+    "factconsolidation_mh_262k": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "factconsolidation_sh_262k": {
+     "score": 17.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_banking77_5900shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_clinic150_7050shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_nlu_8296shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_coarse_6600shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_fine_6400shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "infbench_sum_eng_shots2": {
+     "score": 5.87,
+     "n": 20,
+     "unscored": 80
+    },
+    "longmemeval_s*": {
+     "score": 22.0,
+     "n": 300,
+     "unscored": 0
+    },
+    "recsys_redial_full": {
+     "score": 15.08,
+     "n": 200,
+     "unscored": 0
+    },
+    "ruler_qa1_197K": {
+     "score": 26.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "ruler_qa2_421K": {
+     "score": 31.0,
+     "n": 100,
+     "unscored": 0
+    }
+   },
+   "per_category": {
+    "AR": 34.3,
+    "CR": 10.0,
+    "LRU": 2.93,
+    "TTL": 2.51
+   },
+   "overall": 12.44,
+   "complete": true
+  }
+ },
+ "mab/plain/full": {
+  "n": 2071,
+  "score": 21.63,
+  "mab": {
+   "per_source": {
+    "detective_qa": {
+     "score": 0.0,
+     "n": 71,
+     "unscored": 0
+    },
+    "eventqa_full": {
+     "score": 0.6,
+     "n": 500,
+     "unscored": 0
+    },
+    "factconsolidation_mh_262k": {
+     "score": 4.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "factconsolidation_sh_262k": {
+     "score": 32.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_banking77_5900shot_balance": {
+     "score": 88.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_clinic150_7050shot_balance": {
+     "score": 87.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_nlu_8296shot_balance": {
+     "score": 75.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_coarse_6600shot_balance": {
+     "score": 63.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_fine_6400shot_balance": {
+     "score": 35.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "infbench_sum_eng_shots2": {
+     "score": 0.38,
+     "n": 30,
+     "unscored": 70
+    },
+    "longmemeval_s*": {
+     "score": 7.0,
+     "n": 300,
+     "unscored": 0
+    },
+    "recsys_redial_full": {
+     "score": 11.5,
+     "n": 200,
+     "unscored": 0
+    },
+    "ruler_qa1_197K": {
+     "score": 15.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "ruler_qa2_421K": {
+     "score": 11.0,
+     "n": 100,
+     "unscored": 0
+    }
+   },
+   "per_category": {
+    "AR": 8.4,
+    "CR": 18.0,
+    "LRU": 0.19,
+    "TTL": 59.92
+   },
+   "overall": 21.63,
+   "complete": true
+  }
+ },
+ "mab/plain/memory": {
+  "n": 2071,
+  "score": 8.47,
+  "mab": {
+   "per_source": {
+    "detective_qa": {
+     "score": 0.0,
+     "n": 71,
+     "unscored": 0
+    },
+    "eventqa_full": {
+     "score": 22.6,
+     "n": 500,
+     "unscored": 0
+    },
+    "factconsolidation_mh_262k": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "factconsolidation_sh_262k": {
+     "score": 10.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_banking77_5900shot_balance": {
+     "score": 2.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_clinic150_7050shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_nlu_8296shot_balance": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_coarse_6600shot_balance": {
+     "score": 49.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_fine_6400shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "infbench_sum_eng_shots2": {
+     "score": 0.0,
+     "n": 72,
+     "unscored": 28
+    },
+    "longmemeval_s*": {
+     "score": 10.67,
+     "n": 300,
+     "unscored": 0
+    },
+    "recsys_redial_full": {
+     "score": 9.42,
+     "n": 200,
+     "unscored": 0
+    },
+    "ruler_qa1_197K": {
+     "score": 13.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "ruler_qa2_421K": {
+     "score": 21.0,
+     "n": 100,
+     "unscored": 0
+    }
+   },
+   "per_category": {
+    "AR": 16.82,
+    "CR": 6.5,
+    "LRU": 0.0,
+    "TTL": 10.57
+   },
+   "overall": 8.47,
+   "complete": true
+  }
+ },
+ "mab/plain/question": {
+  "n": 2071,
+  "score": 7.0,
+  "mab": {
+   "per_source": {
+    "detective_qa": {
+     "score": 0.0,
+     "n": 71,
+     "unscored": 0
+    },
+    "eventqa_full": {
+     "score": 10.0,
+     "n": 500,
+     "unscored": 0
+    },
+    "factconsolidation_mh_262k": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "factconsolidation_sh_262k": {
+     "score": 12.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_banking77_5900shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_clinic150_7050shot_balance": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_nlu_8296shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_coarse_6600shot_balance": {
+     "score": 17.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_fine_6400shot_balance": {
+     "score": 22.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "infbench_sum_eng_shots2": {
+     "score": 0.0,
+     "n": 67,
+     "unscored": 33
+    },
+    "longmemeval_s*": {
+     "score": 6.67,
+     "n": 300,
+     "unscored": 0
+    },
+    "recsys_redial_full": {
+     "score": 11.08,
+     "n": 200,
+     "unscored": 0
+    },
+    "ruler_qa1_197K": {
+     "score": 12.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "ruler_qa2_421K": {
+     "score": 18.0,
+     "n": 100,
+     "unscored": 0
+    }
+   },
+   "per_category": {
+    "AR": 11.67,
+    "CR": 7.5,
+    "LRU": 0.0,
+    "TTL": 8.85
+   },
+   "overall": 7.0,
+   "complete": true
+  }
+ },
+ "mab/plain/wrong": {
+  "n": 2071,
+  "score": 7.13,
+  "mab": {
+   "per_source": {
+    "detective_qa": {
+     "score": 0.0,
+     "n": 71,
+     "unscored": 0
+    },
+    "eventqa_full": {
+     "score": 22.0,
+     "n": 500,
+     "unscored": 0
+    },
+    "factconsolidation_mh_262k": {
+     "score": 3.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "factconsolidation_sh_262k": {
+     "score": 18.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_banking77_5900shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_clinic150_7050shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_nlu_8296shot_balance": {
+     "score": 1.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_coarse_6600shot_balance": {
+     "score": 9.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "icl_trec_fine_6400shot_balance": {
+     "score": 0.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "infbench_sum_eng_shots2": {
+     "score": 0.0,
+     "n": 76,
+     "unscored": 24
+    },
+    "longmemeval_s*": {
+     "score": 9.67,
+     "n": 300,
+     "unscored": 0
+    },
+    "recsys_redial_full": {
+     "score": 10.17,
+     "n": 200,
+     "unscored": 0
+    },
+    "ruler_qa1_197K": {
+     "score": 9.0,
+     "n": 100,
+     "unscored": 0
+    },
+    "ruler_qa2_421K": {
+     "score": 18.0,
+     "n": 100,
+     "unscored": 0
+    }
+   },
+   "per_category": {
+    "AR": 14.67,
+    "CR": 10.5,
+    "LRU": 0.0,
+    "TTL": 3.36
+   },
+   "overall": 7.13,
+   "complete": true
+  }
+ },
+ "personamem_32k/nano/memory": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 55.7,
+  "per_category": {
+   "recalling_the_reasons_behind_previous_updates": [
+    82.8,
+    99
+   ],
+   "track_full_preference_evolution": [
+    54.0,
+    139
+   ],
+   "recall_user_shared_facts": [
+    51.9,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    50.9,
+    55
+   ],
+   "suggest_new_ideas": [
+    18.3,
+    93
+   ],
+   "generalizing_to_new_scenarios": [
+    84.2,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    64.7,
+    17
+   ]
+  }
+ },
+ "personamem_32k/nano/question": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 44.8,
+  "per_category": {
+   "recall_user_shared_facts": [
+    31.8,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    21.8,
+    55
+   ],
+   "suggest_new_ideas": [
+    19.4,
+    93
+   ],
+   "recalling_the_reasons_behind_previous_updates": [
+    76.8,
+    99
+   ],
+   "track_full_preference_evolution": [
+    68.3,
+    139
+   ],
+   "generalizing_to_new_scenarios": [
+    29.8,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    29.4,
+    17
+   ]
+  }
+ },
+ "personamem_32k/plain/full": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 48.9,
+  "per_category": {
+   "recalling_the_reasons_behind_previous_updates": [
+    83.8,
+    99
+   ],
+   "track_full_preference_evolution": [
+    55.4,
+    139
+   ],
+   "recall_user_shared_facts": [
+    50.4,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    41.8,
+    55
+   ],
+   "suggest_new_ideas": [
+    9.7,
+    93
+   ],
+   "generalizing_to_new_scenarios": [
+    36.8,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    58.8,
+    17
+   ]
+  }
+ },
+ "personamem_32k/plain/memory": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 51.8,
+  "per_category": {
+   "recall_user_shared_facts": [
+    36.4,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    58.2,
+    55
+   ],
+   "suggest_new_ideas": [
+    10.8,
+    93
+   ],
+   "recalling_the_reasons_behind_previous_updates": [
+    80.8,
+    99
+   ],
+   "track_full_preference_evolution": [
+    62.6,
+    139
+   ],
+   "generalizing_to_new_scenarios": [
+    70.2,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    52.9,
+    17
+   ]
+  }
+ },
+ "personamem_32k/plain/question": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 22.4,
+  "per_category": {
+   "recalling_the_reasons_behind_previous_updates": [
+    46.5,
+    99
+   ],
+   "track_full_preference_evolution": [
+    7.2,
+    139
+   ],
+   "recall_user_shared_facts": [
+    28.7,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    34.5,
+    55
+   ],
+   "suggest_new_ideas": [
+    7.5,
+    93
+   ],
+   "generalizing_to_new_scenarios": [
+    10.5,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    41.2,
+    17
+   ]
+  }
+ },
+ "personamem_32k/plain/wrong": {
+  "n": 589,
+  "total_in_files": 589,
+  "score": 51.4,
+  "per_category": {
+   "track_full_preference_evolution": [
+    64.0,
+    139
+   ],
+   "recalling_the_reasons_behind_previous_updates": [
+    82.8,
+    99
+   ],
+   "recall_user_shared_facts": [
+    31.8,
+    129
+   ],
+   "provide_preference_aligned_recommendations": [
+    60.0,
+    55
+   ],
+   "suggest_new_ideas": [
+    9.7,
+    93
+   ],
+   "generalizing_to_new_scenarios": [
+    70.2,
+    57
+   ],
+   "recalling_facts_mentioned_by_the_user": [
+    52.9,
+    17
+   ]
+  }
+ }
+}
