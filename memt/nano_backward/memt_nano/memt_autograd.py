@@ -7,13 +7,17 @@ The three pieces follow the three items of the task:
    the attention output and the updated state is handed to ``memory_call.results``; the incoming read/write states
    may live on another device, and their gradients go back to that device.
 3. ``MemTMemoryFn`` (+ ``memory_forward`` / ``memory_backward``): ``MemTMemory.forward`` (line 92-132), including the
-   token-by-token sqrt-erase delta-rule write. The write keeps one FP32 state every ``ckpt_every`` tokens; backward
-   recomputes the states of one block at a time and walks it in reverse. Memory therefore grows with
-   L / ckpt_every states instead of one [B, H, K, V] state per token (what plain autograd through the loop keeps).
+   sqrt-erase delta-rule write. Two writers compute the same recurrence:
+   - ``writer="block"`` (default): stable chunked WY form (as MemT trains, report section 4). Blocks of 64 tokens are
+     solved with matrix products and one triangular solve; only decay ratios exp(G_t - G_s) <= 1 appear, so any decay
+     is fine. Forward keeps the FP32 state entering every ``ckpt_every`` tokens; backward recomputes one group of
+     ``ckpt_every`` tokens from it and differentiates that group with autograd.
+   - ``writer="token"``: the released token loop with a hand-written per-token backward (kept as a reference).
 
-The forward arithmetic copies the released code op for op (same casts, same order), so forward outputs are bitwise
-identical to modeling_memt.py. Backward is computed in FP32. Dtype casts in the forward are treated as identity, as
-autograd does; unlike autograd under BF16, intermediate gradients are not rounded to BF16.
+Apart from the writer, the forward arithmetic copies the released code op for op (same casts, same order): reads are
+bitwise identical to modeling_memt.py, the written state agrees to FP32 rounding (block writer) or bitwise (token
+writer). Backward is computed in FP32. Dtype casts in the forward are treated as identity, as autograd does; unlike
+autograd under BF16, intermediate gradients are not rounded to BF16.
 
 Recurrence of one write step (per batch, head; S is K x V, u, d in R^K, w in R^V):
     P_t = diag(d_t) S_{t-1}
@@ -44,7 +48,9 @@ class MemoryConfig:
     norm_eps: float
     softcap: bool
     limit: float
-    ckpt_every: int = 64
+    ckpt_every: int = 256  # tokens between saved write states
+    writer: str = "block"  # "block" (stable chunked WY) or "token" (released loop, per-token backward)
+    block: int = 64  # tokens per triangular solve of the block writer
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -167,6 +173,110 @@ def delta_rule_backward(grad_state, checkpoints, key, write_value, decay, every)
     return grad, d_key, d_write, d_decay
 
 
+def delta_block_stable(state, u, z, lam):
+    """One block of the write in chunked WY form, exact for any lam <= 0.
+    state [N, K, V]; u, lam [N, C, K]; z [N, C, V]. With G = cumsum(lam) inside the block:
+        L[t, s] = sum_k u_tk u_sk exp(G_tk - G_sk)   (s < t)
+        (I + L) E = Z - (exp(G) * U) S_0
+        S_C = exp(G_C) * S_0 + (exp(G_C - G) * U)^T E
+    Only exp of non-positive numbers appears (decay ratios <= 1)."""
+    c = u.shape[1]
+    g = lam.cumsum(dim=1)
+    pair = g[:, :, None, :] - g[:, None, :, :]  # [N, t, s, K] = G_t - G_s
+    below = torch.ones(c, c, dtype=torch.bool, device=u.device).tril(-1)
+    pair = pair.masked_fill(~below[None, :, :, None], float("-inf"))
+    lower = torch.einsum("ntk,nsk,ntsk->nts", u, u, pair.exp())
+    rhs = z - (u * g.exp()) @ state
+    e = torch.linalg.solve_triangular(lower, rhs, upper=False, unitriangular=True)
+    last = g[:, -1:, :]
+    return state * last.transpose(1, 2).exp() + (u * (last - g).exp()).transpose(1, 2) @ e
+
+
+def delta_block_scaled(state, u, z, lam):
+    """The same block in the scaled form (1 / P_t factors). ~9x faster than the stable form but 1 / P_t grows like
+    exp(total decay of the block), so it is only used while that total stays within FAST_MAX_LOG_GROWTH."""
+    grow = torch.exp(-lam.cumsum(dim=1))  # 1 / P_t
+    a, b = u * grow, u / grow
+    lower = torch.tril(b @ a.transpose(1, 2), diagonal=-1)
+    e = torch.linalg.solve_triangular(lower, z - b @ state, upper=False, unitriangular=True)
+    return (state + a.transpose(1, 2) @ e) / grow[:, -1, :, None]
+
+
+# Largest total decay of a group for the scaled form: 1 / P_t <= exp(7.68) ~ 2200 (0.03 per token over 256 tokens,
+# the range the 4B framework's scaled writer has run in; FP32 error stays below 1e-4 there).
+FAST_MAX_LOG_GROWTH = 0.03 * 256
+
+
+def _write_group(state, u, z, lam, block):
+    """A group of tokens (at most `ckpt_every`): scaled form in one solve if its total decay is small in every
+    channel, otherwise the stable form in blocks of `block` tokens. Both are exact; nothing is clipped."""
+    if u.shape[1] <= 256 and float((-lam).sum(dim=1).amax()) <= FAST_MAX_LOG_GROWTH:
+        return delta_block_scaled(state, u, z, lam)
+    for s in range(0, u.shape[1], block):
+        state = delta_block_stable(state, u[:, s : s + block], z[:, s : s + block], lam[:, s : s + block])
+    return state
+
+
+def _heads_first(t):
+    """[B, L, H, D] -> [B * H, L, D]"""
+    b, length, h, d = t.shape
+    return t.permute(0, 2, 1, 3).reshape(b * h, length, d)
+
+
+def block_write_forward(state, key, write_value, lam, block, every):
+    """state [B, H, K, V]; key, lam [B, L, H, K]; write_value [B, L, H, V] (FP32).
+    Returns the final state [B, H, K, V] and the states [B * H, K, V] entering tokens 0, every, 2 * every, ..."""
+    b, h = state.shape[:2]
+    u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
+    s = state.reshape(b * h, *state.shape[2:])
+    checkpoints = []
+    for start in range(0, u.shape[1], every):
+        checkpoints.append(s)
+        s = _write_group(s, u[:, start : start + every], z[:, start : start + every], g[:, start : start + every], block)
+    return s.reshape(state.shape), checkpoints
+
+
+def block_write_backward(grad_state, checkpoints, key, write_value, lam, block, every):
+    """Gradients of block_write_forward: d state, d key, d write_value, d lam. Each group of `every` tokens is
+    recomputed from its saved state and differentiated with autograd (MemT: "reconstructing intermediate quantities
+    during backward")."""
+    b, length, h, _ = key.shape
+    u, z, g = _heads_first(key), _heads_first(write_value), _heads_first(lam)
+    d_u, d_z, d_g = torch.zeros_like(u), torch.zeros_like(z), torch.zeros_like(g)
+    grad = grad_state.reshape(b * h, *grad_state.shape[2:])
+    for index in reversed(range(len(checkpoints))):
+        start, stop = index * every, min(length, (index + 1) * every)
+        with torch.enable_grad():
+            inputs = [t.detach().requires_grad_() for t in
+                      (checkpoints[index], u[:, start:stop], z[:, start:stop], g[:, start:stop])]
+            out = _write_group(*inputs, block)
+            grad, d_u[:, start:stop], d_z[:, start:stop], d_g[:, start:stop] = torch.autograd.grad(
+                out, inputs, grad
+            )
+
+    def back(t, width):  # [B * H, L, D] -> [B, L, H, D]
+        return t.reshape(b, h, length, width).permute(0, 2, 1, 3)
+
+    return grad.reshape(grad_state.shape), back(d_u, u.shape[-1]), back(d_z, z.shape[-1]), back(d_g, g.shape[-1])
+
+
+class BlockWriteFn(torch.autograd.Function):
+    """The block writer alone (used by the tests; MemTMemoryFn calls the same functions)."""
+
+    @staticmethod
+    def forward(ctx, state, key, write_value, lam, block, every):
+        final, checkpoints = block_write_forward(state, key, write_value, lam, block, every)
+        ctx.args = (block, every)
+        ctx.save_for_backward(key, write_value, lam, *checkpoints)
+        return final
+
+    @staticmethod
+    def backward(ctx, grad):
+        key, write_value, lam, *checkpoints = ctx.saved_tensors
+        d_state, d_key, d_write, d_lam = block_write_backward(grad, checkpoints, key, write_value, lam, *ctx.args)
+        return d_state, d_key, d_write, d_lam, None, None
+
+
 class DeltaRuleFn(torch.autograd.Function):
     """The write recurrence alone (used by the tests; MemTMemoryFn calls the same functions)."""
 
@@ -227,11 +337,15 @@ def memory_forward(hidden, params, snapshot, write_state, commit, cfg, with_chec
     sqrt_b = (0.5 * F.logsigmoid(b.float())).exp().to(b.dtype).reshape(shape)
     key = (key.float() * sqrt_b.float()).to(value.dtype).float()
     write_value = w.sigmoid().reshape(shape).float() * value.float()
-    decay = (
+    log_decay = (
         -decay_scale_log.float().exp().reshape(heads, 1)
         * F.softplus(F.linear(f, f_w).float() + decay_bias.float()).reshape(shape)
-    ).exp()
+    )
+    decay = log_decay.exp()  # same ops as the released expression
     start = snapshot.float() if write_state is None else write_state.float()
+    if with_checkpoints and cfg.writer == "block":
+        updated, checkpoints = block_write_forward(start, key, write_value, log_decay, cfg.block, cfg.ckpt_every)
+        return read, updated, checkpoints
     if with_checkpoints:
         updated, checkpoints = delta_rule_forward(start, key, write_value, decay, cfg.ckpt_every)
         return read, updated, checkpoints
@@ -308,17 +422,24 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         z = F.linear(f, f_w).float() + decay_bias.float()
         softplus_z = F.softplus(z)
         scale = decay_scale_log.float().exp().reshape(heads, 1)
-        decay = (-scale * softplus_z.reshape(shape)).exp()
+        log_decay = -scale * softplus_z.reshape(shape)
+        decay = log_decay.exp()
 
-        if grad_updated is not None:
-            d_start, d_u, d_wv, d_decay = delta_rule_backward(
-                grad_updated.float(), checkpoints, u, write_value, decay, cfg.ckpt_every
-            )
-        else:
+        # d_exponent = dL / d(log decay)
+        if grad_updated is None:
             d_start = torch.zeros_like(snap)
             d_u = torch.zeros_like(u)
             d_wv = torch.zeros_like(write_value)
-            d_decay = torch.zeros_like(decay)
+            d_exponent = torch.zeros_like(decay)
+        elif cfg.writer == "block":
+            d_start, d_u, d_wv, d_exponent = block_write_backward(
+                grad_updated.float(), checkpoints, u, write_value, log_decay, cfg.block, cfg.ckpt_every
+            )
+        else:
+            d_start, d_u, d_wv, d_decay = delta_rule_backward(
+                grad_updated.float(), checkpoints, u, write_value, decay, cfg.ckpt_every
+            )
+            d_exponent = d_decay * decay
 
         # u = k_hat * sqrt(sigmoid(b))
         d_k = _l2norm_backward(d_u * sqrt_b_used, k_hat, k_rstd).reshape(flat)
@@ -327,7 +448,6 @@ def memory_backward(grad_read, grad_updated, hidden, params, snapshot, write_sta
         d_v = (d_wv * sig_w).reshape(flat)
         d_w = (d_wv * value.float() * sig_w * (1 - sig_w)).reshape(flat)
         # decay = exp(-exp(scale_log) * softplus(f_down(f) + decay_bias))
-        d_exponent = d_decay * decay
         d_scale_log = -(d_exponent * scale * softplus_z.reshape(shape)).sum((0, 1, 3))
         softplus_grad = torch.where(z > 20, torch.ones_like(z), torch.sigmoid(z))  # F.softplus threshold 20
         d_z = (-(d_exponent * scale)).reshape(flat) * softplus_grad
