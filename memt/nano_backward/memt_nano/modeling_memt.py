@@ -3,11 +3,11 @@
 Backbone computation and generation use Transformers 5.12.1. Only the trained
 memory branch and its lifecycle are implemented here.
 
-Training additions (memt_autograd.py): hand-written backward for MemTRMSNormGated
-(soft-capped gate), for MemTMemory (read + token-level write, block-checkpointed)
-and for the memory part of MemTAttention.forward. They are used whenever a
-gradient is needed; without grad the released inference code runs unchanged.
-commit_memory_train is commit_memory with gradients kept across chunks.
+训练用的新增部分(memt_autograd.py):为 MemTRMSNormGated(带软上限的门)、
+MemTMemory(读出 + 逐 token 规则的写入,分块计算并按组存档)以及
+MemTAttention.forward 里的记忆部分手写了 backward。只在需要梯度时使用;
+不求梯度时,运行的仍是官方的推理代码,没有改动。
+commit_memory_train 是保留跨 chunk 梯度的 commit_memory。
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen
 from .configuration_memt import MemTQwen3_5MoeConfig
 from .memt_autograd import GatedRMSNormFn, MemoryConfig, MemoryResidualFn, MemTMemoryFn
 
-# False: run the released forward code under autograd instead (reference for tests; keeps one
-# state per token in the write loop, so only usable for short inputs).
+# False:改为让官方前向代码直接走 autograd(测试用的参照;写入循环里每个 token 都要保存一份状态,
+# 所以只能用于短输入)。
 USE_CUSTOM_BACKWARD = True
 
 
@@ -54,7 +54,7 @@ def _needs_grad(*tensors):
 
 
 def _conv_state_out_of_place(self, conv_states, state_idx=0, conv_kernel_size=None, **kwargs):
-    # transformers 5.20 LinearAttentionLayer.update_conv_state with assignment instead of copy_
+    # transformers 5.20 的 LinearAttentionLayer.update_conv_state,把 copy_ 改成赋值
     if not self.is_conv_states_initialized[state_idx]:
         self.lazy_initialization(
             conv_states=conv_states, state_idx=state_idx, conv_kernel_size=conv_kernel_size
@@ -73,7 +73,7 @@ def _conv_state_out_of_place(self, conv_states, state_idx=0, conv_kernel_size=No
 
 
 def _recurrent_state_out_of_place(self, recurrent_states, state_idx=0, **kwargs):
-    # transformers 5.20 LinearAttentionLayer.update_recurrent_state with assignment instead of copy_
+    # transformers 5.20 的 LinearAttentionLayer.update_recurrent_state,把 copy_ 改成赋值
     if not self.is_recurrent_states_initialized[state_idx]:
         self.lazy_initialization(recurrent_states=recurrent_states, state_idx=state_idx)
     self.recurrent_states[state_idx] = recurrent_states
@@ -85,7 +85,7 @@ def _out_of_place_linear_attention_cache():
     from transformers import cache_utils
 
     layer = getattr(cache_utils, "LinearAttentionLayer", None)
-    if layer is None:  # other transformers versions: leave the cache as it is
+    if layer is None:  # 其他 transformers 版本:缓存保持原样
         yield
         return
     saved = layer.update_conv_state, layer.update_recurrent_state
@@ -107,7 +107,7 @@ class MemTRMSNormGated(nn.Module):
 
     def forward(self, value, gate):
         if _needs_grad(value, gate, self.weight):
-            # backward: memt_autograd.gated_rmsnorm_backward (soft cap included)
+            # 反向:memt_autograd.gated_rmsnorm_backward(含软上限)
             return GatedRMSNormFn.apply(value, gate, self.weight, self.eps, self.softcap, self.limit)
         normalized = value.float() * torch.rsqrt(
             value.float().square().mean(-1, keepdim=True) + self.eps
@@ -156,11 +156,12 @@ class MemTMemory(nn.Module):
         result = value.float() * torch.rsqrt(value.float().square().sum(-1, keepdim=True) + 1e-6)
         return result.to(value.dtype) if rounded else result
 
-    # Training-time writer (memt_autograd): "block" = stable chunked WY form solved per `write_block` tokens,
-    # "token" = the released token loop with a per-token backward. Both compute the same recurrence.
+    # 训练时的写入算法(memt_autograd):"block" = 分块 WY 形式,每 `write_block` 个 token 一块(必须是 2 的幂),
+    # 块内只有矩阵乘和一次三角求解,衰减多大都稳定;每块开始时存一份 FP32 状态,反向时从它重算。
+    # "token" = 官方的逐 token 循环,配逐 token 反向。两者计算的是同一个递推。
     writer = "block"
-    write_block = 64
-    # Tokens between saved FP32 write states; backward recomputes one such group at a time.
+    write_block = 256
+    # "token" 算法保存 FP32 写入状态的间隔(token 数);反向时每次重算这样一组。
     checkpoint_every = 256
 
     def memory_config(self):
@@ -196,7 +197,7 @@ class MemTMemory(nn.Module):
             return hidden.new_zeros(batch, length, self.value_dim), None
         if not self.needs_grad(hidden, state, write_state):
             return self.forward_reference(hidden, state, commit, write_state=write_state)
-        # backward: memt_autograd.memory_backward (read path, write path, block-checkpointed recurrence)
+        # 反向:memt_autograd.memory_backward(读路径、写路径、按组存档的写入递推)
         snapshot = (
             hidden.new_zeros((hidden.shape[0], self.num_heads, self.head_dim, self.head_dim), dtype=torch.float32)
             if state is None
@@ -209,7 +210,7 @@ class MemTMemory(nn.Module):
         return MemTMemoryFn.apply(hidden, snapshot, write_state, cfg, False, *params), state
 
     def forward_reference(self, hidden, state=None, commit=False, *, write_state=None):
-        """The released forward (line 92-132 of the original file), unchanged."""
+        """官方的 forward(原文件第 92-132 行),未改动。"""
         batch, length, _ = hidden.shape
         dim, width = self.head_dim, self.value_dim
         shape = (batch, length, self.num_heads, dim)
@@ -379,8 +380,8 @@ class MemTAttention(qwen.Qwen3_5MoeAttention):
             commit = memory_call.write is not None
             writer = memory_call.write.get(self.layer_idx) if commit else None
             if (state is not None or commit) and self.memt.needs_grad(hidden_states, state, writer):
-                # backward: memt_autograd.MemoryResidualFn (d output passes through, d read -> memory
-                # backward, state / writer gradients go back to their own devices)
+                # 反向:memt_autograd.MemoryResidualFn(d output 原样传回,d read 进入记忆的反向,
+                # state / writer 的梯度送回各自所在的设备)
                 result = MemoryResidualFn.apply(
                     output,
                     hidden_states,
@@ -539,12 +540,12 @@ class MemTQwen3_5MoeForCausalLM(qwen.Qwen3_5MoePreTrainedModel, GenerationMixin)
         return self._commit_memory(input_ids, memory_state, document=document)
 
     def commit_memory_train(self, input_ids, memory_state=None, *, document=False):
-        """commit_memory with autograd on: the returned states keep their graph, so a
-        loss on a later query reaches the memory parameters of every committed chunk.
+        """开着 autograd 的 commit_memory:返回的状态保留计算图,所以后面问题上的 loss
+        能把梯度传到每个已写入 chunk 的记忆参数。
 
-        A QA event longer than chunk_tokens carries the backbone KV/GDN cache into its
-        next chunk; transformers updates the GDN conv/recurrent cache in place (copy_),
-        which autograd rejects, so those two updates are made out of place here."""
+        一个 QA 事件超过 chunk_tokens 时,backbone 的 KV/GDN 缓存会带进下一个 chunk;
+        transformers 用原地 copy_ 更新 GDN 的 conv/recurrent 缓存,autograd 不允许,
+        所以这里把这两处更新改成不原地进行。"""
         with _out_of_place_linear_attention_cache():
             return self._commit_memory(input_ids, memory_state, document=document)
 

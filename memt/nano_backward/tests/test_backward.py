@@ -1,17 +1,20 @@
-"""Checks of the hand-written MemT backward against autograd through the released forward.
+"""手写的 MemT backward 与"官方 forward 直接走 autograd"的对照检查。
 
-    python tests/test_backward.py            # CPU checks 1-5
-    python tests/test_backward.py --gpu      # + check 6: Nano-size memory layer, speed and peak memory
+    python tests/test_backward.py                                # CPU 检查 1-5
+    python tests/test_backward.py --gpu                          # 加检查 6:Nano 尺寸的记忆层,速度和显存峰值
+    python tests/test_backward.py --gpu-only --length 512 2048   # 只跑检查 6
 
-1. MemTRMSNormGated (soft cap on/off, FP32/BF16): forward bitwise equal, gradients vs autograd
-2. write recurrence alone: torch.autograd.gradcheck in FP64
-3. MemTMemory, all read/commit/state/write_state/bias/softcap combinations, FP32: forward bitwise, gradients
-4. MemTMemory in BF16: forward bitwise, gradients close to BF16 autograd
-5. tiny MemT model end to end (frozen backbone): commit_memory_train over several chunks (document and QA-event
-   replay), then a query; loss and memory-parameter gradients vs the released code under autograd; and the no-grad
-   commit_memory output bitwise equal to the released file
-6. (--gpu) one Nano-size memory layer (2048 hidden, 16 heads x 256, 2048 tokens, BF16): time / peak memory
-"""
+1. MemTRMSNormGated(软上限开/关,FP32/BF16):前向逐位相同,梯度与 autograd 对比
+2. 写入递推本身:FP64 下的 torch.autograd.gradcheck;block 算法(分块 WY)与逐 token 循环一致;
+   block 的手写反向与 autograd 对比(对同一前向、对逐 token 循环各一次);FP32 下从零衰减到极大衰减的误差
+3. MemTMemory,读/写/state/write_state/bias/软上限的全部组合,FP32,两种写入算法:前向和梯度
+4. BF16 下的 MemTMemory:读出逐位相同,梯度接近 BF16 的 autograd
+   4b:FP32 权重在 torch.autocast(bfloat16) 下运行,写入仍保持 FP32
+5. 小型 MemT 模型端到端(backbone 冻结):commit_memory_train 写入多个 chunk(文档模式,以及文档 + QA 事件回放),
+   再做一次 query;loss 和记忆参数的梯度与官方代码走 autograd 的结果对比;不求梯度的 commit_memory
+   输出与官方文件逐位相同
+6. (--gpu)先在 GPU 上重跑检查 5(装了 FLA 时 backbone 的 GDN 层走 FLA 的 kernel);
+   再测 Nano 尺寸的单个记忆层(hidden 2048、16 头 x 256、BF16):三种方式的时间和显存峰值"""
 
 import argparse
 import os
@@ -24,16 +27,10 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen  # noqa: E402
+from memt_nano import compat  # noqa: E402
 
-# modeling_memt.py targets transformers 5.12.1; this env has 5.20 (same shims as the 9-5 benchmark runner).
-for _name, _value in {
-    "torch_causal_conv1d_update": qwen.causal_conv1d_update,
-    "chunk_gated_delta_rule": None,
-    "fused_recurrent_gated_delta_rule": None,
-}.items():
-    if not hasattr(qwen, _name):
-        setattr(qwen, _name, _value)
+# modeling_memt.py 针对 transformers 5.12.1;compat.apply() 让它在 5.20 上运行,并在 GPU 上用 FLA 的 GDN kernel。
+compat.apply()
 
 from memt_nano import memt_autograd as ma  # noqa: E402
 from memt_nano import modeling_memt as M  # noqa: E402
@@ -72,7 +69,7 @@ def test_gated_norm():
                 new.weight.copy_(ref.weight)
             ref.to(dtype), new.to(dtype)
             value = (torch.randn(2, 5, 3, 16) * 3).to(dtype)
-            gate = (torch.randn(2, 5, 3, 16) * 4).to(dtype)  # silu up to ~12: the cap at 2 is active
+            gate = (torch.randn(2, 5, 3, 16) * 4).to(dtype)  # silu 最大约 12:上限 2 会生效
             probe = torch.randn(2, 5, 3, 16)
             outs, grads = [], []
             for module in (ref, new):
@@ -104,8 +101,8 @@ def test_delta_rule_gradcheck():
         )
         check(f"gradcheck ckpt_every={every}", ok)
 
-    print("== 2b. block writer (stable chunked WY): equals the token loop for any decay, gradcheck FP64")
-    for log_decay_scale in (1e-3, 0.5, 5.0):
+    print("== 2b. block writer (chunked WY): equals the token loop for any decay, gradcheck FP64")
+    for log_decay_scale in (0.0, 1e-3, 0.5, 5.0, 50.0):
         state = torch.randn(batch, heads, kdim, vdim, dtype=torch.float64)
         key = torch.randn(batch, 40, heads, kdim, dtype=torch.float64)
         key = torch.rand(batch, 40, heads, 1, dtype=torch.float64).sqrt() * key / key.norm(dim=-1, keepdim=True)
@@ -114,44 +111,89 @@ def test_delta_rule_gradcheck():
         ref = state
         for t in range(40):
             ref = ma.delta_rule_step(ref, key[:, t], write[:, t], lam[:, t].exp())
-        for block, every in ((1, 1), (3, 8), (64, 256), (7, 40)):
-            out, _ = ma.block_write_forward(state, key, write, lam, block, every)
-            check(f"block == token loop, decay scale {log_decay_scale}, block {block}, every {every}",
+        for block in (1, 2, 8, 32, 64, 256):
+            out, _ = ma.block_write_forward(state, key, write, lam, block)
+            check(f"block == token loop, decay scale {log_decay_scale}, block {block}",
                   torch.allclose(out, ref, rtol=1e-10, atol=1e-10))
     state = torch.randn(batch, heads, kdim, vdim, dtype=torch.float64)
     key = torch.randn(batch, length, heads, kdim, dtype=torch.float64)
     key = 0.9 * key / key.norm(dim=-1, keepdim=True)
     write = torch.randn(batch, length, heads, vdim, dtype=torch.float64)
-    for path, scale in (("stable path", 1.0), ("scaled path", 0.01)):
+    for scale in (0.01, 1.0, 20.0):
         lam = -torch.rand(batch, length, heads, kdim, dtype=torch.float64) * scale
         inputs = tuple(t.detach().requires_grad_() for t in (state, key, write, lam))
-        for block, every in ((1, 1), (3, 4), (4, 11), (64, 256)):
+        for block in (1, 4, 16, 256):
             ok = torch.autograd.gradcheck(
-                lambda s, k, w, g: ma.BlockWriteFn.apply(s, k, w, g, block, every), inputs, eps=1e-6, atol=1e-7
+                lambda s, k, w, g: ma.BlockWriteFn.apply(s, k, w, g, block), inputs, eps=1e-6, atol=1e-7
             )
-            check(f"gradcheck block writer ({path}) block={block} every={every}", ok)
-    # FP32 accuracy of the scaled path at its threshold (every channel just below the largest accepted decay)
-    state32 = torch.randn(1, heads, kdim, vdim, dtype=torch.float64)
-    key32 = torch.randn(1, 512, heads, kdim, dtype=torch.float64)
-    key32 = 0.9 * key32 / key32.norm(dim=-1, keepdim=True)
-    write32 = torch.randn(1, 512, heads, vdim, dtype=torch.float64)
-    lam32 = torch.full((1, 512, heads, kdim), -0.999 * ma.FAST_MAX_LOG_GROWTH / 256, dtype=torch.float64)
-    ref = state32
-    for t in range(512):
-        ref = ma.delta_rule_step(ref, key32[:, t], write32[:, t], lam32[:, t].exp())
-    out, _ = ma.block_write_forward(*(x.float() for x in (state32, key32, write32, lam32)), 64, 256)
-    check_rel("scaled path FP32 at its threshold vs FP64 token loop", out, ref, 1e-4)
+            check(f"gradcheck block writer, decay scale {scale}, block={block}", ok)
+
+    print("== 2c. block writer pieces, FP64: L vs the pairwise formula; hand-written backward vs autograd")
+    names = ("d state", "d key", "d write_value", "d lam")
+    for count, kd, vd in ((1, 4, 3), (5, 4, 3), (37, 6, 5), (130, 6, 5)):
+        s0 = torch.randn(2, 3, kd, vd, dtype=torch.float64)
+        kk = torch.randn(2, count, 3, kd, dtype=torch.float64)
+        kk = torch.rand(2, count, 3, 1, dtype=torch.float64).sqrt() * kk / kk.norm(dim=-1, keepdim=True)
+        zz = torch.randn(2, count, 3, vd, dtype=torch.float64)
+        gout = torch.randn(2, 3, kd, vd, dtype=torch.float64)
+        for scale in (0.01, 3.0, 50.0):
+            ll = -torch.rand(2, count, 3, kd, dtype=torch.float64) * scale
+            inputs = [t.detach().requires_grad_() for t in (s0, kk, zz, ll)]
+            # 参照 1:逐 token 循环走 autograd(与分块实现完全独立)
+            loop = inputs[0]
+            for t in range(count):
+                loop = ma.delta_rule_step(loop, inputs[1][:, t], inputs[2][:, t], inputs[3][:, t].exp())
+            ref_loop = torch.autograd.grad(loop, inputs, gout)
+            for block in (1, 4, 64):
+                # 参照 2:同一个分块前向走 autograd
+                ref_same = torch.autograd.grad(ma.block_write_forward(*inputs, block)[0], inputs, gout)
+                with torch.no_grad():
+                    _, starts = ma.block_write_forward(s0, kk, zz, ll, block)
+                    got = ma.block_write_backward(gout, starts, kk, zz, ll, block)
+                worst_same = max(rel(a, b) for a, b in zip(got, ref_same))
+                worst_loop = max(rel(a, b) for a, b in zip(got, ref_loop))
+                check(f"block backward, L={count}, block={block}, decay scale {scale}",
+                      worst_same <= 1e-9 and worst_loop <= 1e-9,
+                      f"vs autograd of the same forward {worst_same:.1e}, of the token loop {worst_loop:.1e}")
+    check("block backward runs without autograd", all(not t.requires_grad for t in got))
+    # L 的分层矩阵乘算法 与 直接两两相乘的公式
+    uu = torch.randn(3, 64, 8, dtype=torch.float64)
+    gg = (-torch.rand(3, 64, 8, dtype=torch.float64) * 3).cumsum(1)
+    ratio = (gg[:, :, None] - gg[:, None]).exp() * torch.ones(64, 64, dtype=torch.float64).tril(-1)[None, :, :, None]
+    check_rel("wy_lower vs pairwise formula", ma.wy_lower(uu, gg), torch.einsum("ntk,nsk,ntsk->nts", uu, uu, ratio), 1e-12)
+
+    print("== 2d. block writer in FP32 vs the FP64 token loop, weak to extreme decay (512 tokens, block 256)")
+    for scale in (0.0, 0.03, 1.0, 10.0, 100.0):
+        torch.manual_seed(5)
+        s0 = torch.randn(1, 4, 32, 32, dtype=torch.float64)
+        kk = torch.randn(1, 512, 4, 32, dtype=torch.float64)
+        kk = torch.rand(1, 512, 4, 1, dtype=torch.float64).sqrt() * kk / kk.norm(dim=-1, keepdim=True)
+        zz = torch.randn(1, 512, 4, 32, dtype=torch.float64)
+        ll = -torch.rand(1, 512, 4, 32, dtype=torch.float64) * scale
+        gout = torch.randn(1, 4, 32, 32, dtype=torch.float64)
+        inputs = [t.detach().requires_grad_() for t in (s0, kk, zz, ll)]
+        loop = inputs[0]
+        for t in range(512):
+            loop = ma.delta_rule_step(loop, inputs[1][:, t], inputs[2][:, t], inputs[3][:, t].exp())
+        truth = torch.autograd.grad(loop, inputs, gout)
+        f32 = [t.float() for t in (s0, kk, zz, ll)]
+        out, starts = ma.block_write_forward(*f32, 256)
+        got = ma.block_write_backward(gout.float(), starts, *f32[1:], 256)
+        check_rel(f"FP32 written state, decay scale {scale}", out, loop.detach(), 1e-5)
+        for name, a, b in zip(names, got, truth):
+            if b.norm() > 1e-30:  # 衰减极大时 d state 的真值就是 0
+                check_rel(f"FP32 {name}, decay scale {scale}", a, b, 1e-4)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-def memory_pair(hidden_size, heads, dim, bias, softcap, dtype, every, seed=3, writer="block", block=3):
+def memory_pair(hidden_size, heads, dim, bias, softcap, dtype, every, seed=3, writer="block", block=4):
     cfg = {"output_gate_bias": bias, "output_gate_softcap_enabled": softcap, "output_gate_softcap_limit": 2.0}
     torch.manual_seed(seed)
     ref = O.MemTMemory(cfg, hidden_size, heads, dim)
     with torch.no_grad():
-        for p in ref.parameters():  # move away from the near-zero init so every path carries signal
+        for p in ref.parameters():  # 离开接近零的初始值,让每条路径都有信号
             p.add_(torch.randn_like(p) * 0.3)
-        ref.decay_bias.normal_()  # decays between ~0.3 and ~1 instead of ~0.9999
+        ref.decay_bias.normal_()  # 衰减在约 0.3 到 1 之间,而不是约 0.9999
     new = M.MemTMemory(cfg, hidden_size, heads, dim)
     new.load_state_dict(ref.state_dict())
     new.checkpoint_every, new.writer, new.write_block = every, writer, block
@@ -193,13 +235,38 @@ def test_memory(dtype, tol, cases, writer):
         if writer == "token" or u_ref is None:
             same = torch.equal(r_ref, r_new) and (u_ref is None or torch.equal(u_ref, u_new))
             check(f"forward bitwise  {tag}", same)
-        else:  # reads bitwise; the block writer agrees with the token loop to FP32 rounding
+        else:  # 读出逐位相同;block 写入与逐 token 循环相差 FP32 舍入量级
             check(f"read bitwise     {tag}", torch.equal(r_ref, r_new))
             check_rel(f"written state    {tag}", u_new, u_ref, 1e-5)
         worst = max((rel(g_new[k], g_ref[k]), k) for k in g_ref if g_ref[k] is not None)
         missing = [k for k in g_ref if (g_ref[k] is None) != (g_new[k] is None)]
         check(f"grads            {tag}", worst[0] <= tol and not missing,
               f"worst rel {worst[0]:.2e} ({worst[1]}) tol {tol:.0e} {missing or ''}")
+
+
+def test_memory_autocast():
+    print("== 4b. MemTMemory with FP32 weights under torch.autocast(bfloat16)")
+    batch, length, hidden_size, heads, dim = 2, 29, 24, 2, 8
+    for writer in ("block", "token"):
+        for has_state in (False, True):
+            ref, new = memory_pair(hidden_size, heads, dim, False, True, torch.float32, every=8, writer=writer)
+            torch.manual_seed(4)
+            x = torch.randn(batch, length, hidden_size)
+            state = torch.randn(batch, heads, dim, dim) * 0.5 if has_state else None
+            probes = (torch.randn(batch, length, heads * dim), torch.randn(batch, heads, dim, dim))
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                r_ref, u_ref, g_ref = run_memory(ref, x, state, None, True, probes)
+                r_new, u_new, g_new = run_memory(new, x, state, None, True, probes)
+            tag = f"writer={writer} state={int(has_state)}"
+            check(f"read bitwise     {tag}", torch.equal(r_ref, r_new) and r_new.dtype == r_ref.dtype)
+            # 写入必须留在 FP32:如果里面的矩阵乘被 autocast 降到 BF16,这里的误差会到 1e-2
+            if writer == "token":
+                check(f"written state bitwise {tag}", torch.equal(u_ref, u_new))
+            else:
+                check_rel(f"written state    {tag}", u_new, u_ref, 1e-5)
+            worst = max((rel(g_new[k], g_ref[k]), k) for k in g_ref if g_ref[k] is not None)
+            dtypes = all(g_new[k].dtype == g_ref[k].dtype for k in g_ref if g_ref[k] is not None)
+            check(f"grads            {tag}", worst[0] <= 5e-2 and dtypes, f"worst rel {worst[0]:.2e} ({worst[1]})")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -230,30 +297,31 @@ def tiny_config():
 def build(module, config, chunk, every):
     torch.manual_seed(5)
     model = module.MemTQwen3_5MoeForCausalLM(config).float().eval()
-    for layer in model.model.language_model.layers:  # 5.20 decoder forward reads block_type
+    for layer in model.model.language_model.layers:  # 5.20 的 decoder forward 会读取 block_type
         if not hasattr(layer, "block_type"):
             layer.block_type = layer.layer_type
-    model.config.memt["chunk_tokens"] = chunk  # several write chunks in a short test
+    model.config.memt["chunk_tokens"] = chunk  # 短测试里也有多个写入 chunk
     for name, p in model.named_parameters():
         p.requires_grad_(".memt." in name)
     for layer in model.model.language_model.layers:
         if hasattr(layer, "self_attn"):
             layer.self_attn.memt.checkpoint_every = every
-            layer.self_attn.memt.write_block = 3
+            layer.self_attn.memt.write_block = 4
             with torch.no_grad():
                 layer.self_attn.memt.decay_bias.normal_()
-                layer.self_attn.memt.g_down.weight.mul_(8)  # larger reads so the query depends on memory
+                layer.self_attn.memt.g_down.weight.mul_(8)  # 放大读出,让 query 依赖记忆
     return model
 
 
-def test_end_to_end():
-    print("== 5. tiny MemT model, end to end")
+def test_end_to_end(device="cpu"):
+    backend = compat.gdn_backend() if device == "cuda" else "torch"
+    print(f"== 5. tiny MemT model, end to end ({device}, backbone GDN: {backend})")
     config = tiny_config()
-    model = build(M, config, chunk=16, every=5)
+    model = build(M, config, chunk=16, every=5).to(device)
     torch.manual_seed(6)
-    document = torch.randint(3, 97, (1, 50))
-    events = torch.randint(3, 97, (1, 37))
-    query = torch.randint(3, 97, (1, 21))
+    document = torch.randint(3, 97, (1, 50), device=device)
+    events = torch.randint(3, 97, (1, 37), device=device)
+    query = torch.randint(3, 97, (1, 21), device=device)
 
     def run(custom, replay_events):
         M.USE_CUSTOM_BACKWARD = custom
@@ -276,7 +344,7 @@ def test_end_to_end():
             tag = f"{writer} writer, " + ("document + QA-event replay" if replay else "document")
             if writer == "token":
                 check(f"loss bitwise ({tag})", torch.equal(loss_ref, loss_new), f"{loss_new.item():.6f}")
-            else:  # the block writer agrees with the token loop to FP32 rounding
+            else:  # block 写入与逐 token 循环相差 FP32 舍入量级
                 check_rel(f"loss ({tag})", loss_new, loss_ref, 1e-6)
             nonzero = sum(int(g.abs().max() > 0) for g in g_ref.values())
             worst = max((rel(g_new[k], g_ref[k]), k) for k in g_ref)
@@ -284,7 +352,7 @@ def test_end_to_end():
                   f"worst rel {worst[0]:.2e} ({worst[1]}), {nonzero}/{len(g_ref)} tensors nonzero")
     M.USE_CUSTOM_BACKWARD = True
 
-    original = build(O, config, chunk=16, every=5)
+    original = build(O, config, chunk=16, every=5).to(device)
     original.load_state_dict(model.state_dict())
     with torch.no_grad():
         s_new = model.commit_memory(events, model.commit_memory(document, document=True))
@@ -308,7 +376,7 @@ def test_end_to_end():
 def test_gpu_nano_layer(length, with_autograd=True):
     print(f"== 6. Nano-size memory layer on GPU, {length} tokens, BF16")
     device = torch.device("cuda")
-    ref, block = memory_pair(2048, 16, 256, False, True, torch.bfloat16, every=256, writer="block", block=64)
+    ref, block = memory_pair(2048, 16, 256, False, True, torch.bfloat16, every=256, writer="block", block=256)
     _, token = memory_pair(2048, 16, 256, False, True, torch.bfloat16, every=64, writer="token")
     ref, block, token = ref.to(device), block.to(device), token.to(device)
     torch.manual_seed(7)
@@ -317,7 +385,7 @@ def test_gpu_nano_layer(length, with_autograd=True):
     probes = (torch.randn(1, length, 4096, device=device), torch.randn(1, 16, 256, 256, device=device))
     runs = [("block", block), ("token", token)] + ([("autograd", ref)] if with_autograd else [])
     short = (x[:, :64], (probes[0][:, :64], probes[1]))
-    for _, module in runs:  # warm-up (CUDA context, cuBLAS) before timing
+    for _, module in runs:  # 计时前先预热(CUDA 上下文、cuBLAS)
         run_memory(module, short[0], state, None, True, short[1])
         for p in module.parameters():
             p.grad = None
@@ -349,6 +417,36 @@ def test_gpu_nano_layer(length, with_autograd=True):
         for k in g_ref:
             print(f"   {name} vs {reference}: {k:18s} grad rel diff {rel(g_new[k], g_ref[k]):.2e}"
                   f"   |grad| {g_ref[k].float().norm():.3e}")
+    # in_proj 反向的两次大矩阵乘:默认按前向的精度(BF16)算。与在 FP32 下算的结果比较,并与 BF16 autograd 比较
+    ma.PROJECTION_BACKWARD_DTYPE = torch.float32
+    torch.cuda.synchronize()
+    start = time.time()
+    g_fp32 = run_memory(block, x, state, None, True, probes)[2]
+    torch.cuda.synchronize()
+    print(f"   block with FP32 in_proj backward: fwd+bwd {time.time() - start:6.2f} s")
+    ma.PROJECTION_BACKWARD_DTYPE = None
+    for k in ("hidden", "in_proj.weight"):
+        ours = rel(results["block"][2][k], g_fp32[k])
+        line = f"   {k:15s} grad: default (forward precision) vs FP32 in_proj backward, rel diff {ours:.2e}"
+        if "autograd" in results:
+            theirs = rel(results["autograd"][2][k], g_fp32[k])
+            line += f";  BF16 autograd vs FP32: {theirs:.2e}"
+            check(f"{k}: default in_proj backward is closer to FP32 than BF16 autograd", ours <= theirs)
+        print(line)
+    for p in block.parameters():
+        p.grad = None
+    if with_autograd and "autograd" in results:
+        # 谁更接近真实梯度:同一组权重和输入放到 FP64 下,用官方代码走 autograd,作为参照
+        import copy
+        exact = copy.deepcopy(ref).double()
+        _, _, g_exact = run_memory(exact, x.double(), state.double(), None, True,
+                                   (probes[0].double(), probes[1].double()))
+        worst = {name: max(rel(results[name][2][k], g_exact[k]) for k in g_exact) for name in results}
+        for name, value in worst.items():
+            print(f"   {name:8s} vs FP64 gradients of the released code: worst rel diff {value:.2e}")
+        check("block gradients are as close to FP64 as BF16 autograd", worst["block"] <= 1.1 * worst["autograd"])
+        del exact, g_exact
+        torch.cuda.empty_cache()
 
 
 def main():
@@ -360,6 +458,7 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(8)
     if args.gpu_only:
+        test_end_to_end("cuda")
         for length in args.length:
             test_gpu_nano_layer(length, not args.no_autograd)
         print(f"\n{len(FAILED)} failed" + (f": {FAILED}" if FAILED else ""))
@@ -367,14 +466,16 @@ def main():
     test_gated_norm()
     test_delta_rule_gradcheck()
     import itertools
-    # (commit, state, write_state, bias, softcap); without commit a state is needed (else the read is a constant
-    # zero) and write_state is unused
+    # (commit, state, write_state, bias, softcap);不写入时必须有 state(否则读出恒为零),
+    # 且用不到 write_state
     full = [c for c in itertools.product((False, True), repeat=5) if c[0] or (c[1] and not c[2])]
     for writer in ("block", "token"):
         test_memory(torch.float32, 1e-4, full, writer)
     test_memory(torch.bfloat16, 5e-2, [c for c in full if c[3] is False], "block")
+    test_memory_autocast()
     test_end_to_end()
     if args.gpu:
+        test_end_to_end("cuda")
         for length in args.length:
             test_gpu_nano_layer(length, not args.no_autograd)
     print(f"\n{len(FAILED)} failed" + (f": {FAILED}" if FAILED else ""))
