@@ -53,7 +53,7 @@ def add_model_args(p: argparse.ArgumentParser):
     m.add_argument("--mem-stable-matrix-gates", action="store_true",
                    help="evaluate sqrt(sigmoid(erase_logits)) through log-sigmoid for finite extreme-logit gradients")
     m.add_argument("--mem-forget-rank", type=int, default=64, help="--mem-core matrix: width of the forget gate")
-    # MemT-1.0 alignment of the matrix memory (defaults = the archived 4B run; see MemoryConfig)
+    # 矩阵记忆与 MemT-1.0 的对齐(默认值 = 归档的 4B 训练设置;见 MemoryConfig)
     m.add_argument("--mem-decay-cap", type=_decay_cap, default=MAX_DECAY,
                    help="bound on the per-token decay; 'none' = no bound (MemT-1.0)")
     m.add_argument("--mem-write-impl", choices=["scaled", "stable", "auto"], default="scaled",

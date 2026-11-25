@@ -1,8 +1,7 @@
-"""Speed / memory of the matrix-memory writers on GPU: delta_write (1 / P_i trick, needs the decay cap) vs
-delta_write_stable (any decay), forward + backward on one storage step, plus their agreement.
+"""矩阵记忆几种写入算法在 GPU 上的速度和显存:delta_write(1 / P_i 技巧,需要衰减上限)、
+delta_write_stable(任意衰减)和 delta_write_auto,测一个存储步的前向 + 反向,并比较结果是否一致。
 
-    python scripts/bench_matrix_write.py --heads 32 --dim 128 --length 2048     # Qwen3-4B layer (batch 1)
-"""
+    python scripts/bench_matrix_write.py --heads 32 --dim 128 --length 2048     # Qwen3-4B 的一层(batch 1)"""
 import argparse
 import os
 import sys
@@ -38,7 +37,7 @@ def main():
     k = torch.nn.functional.normalize(torch.randn(n, length, d, device="cuda"), dim=-1)
     u = torch.rand(n, length, d, device="cuda").sqrt() * k
     z = torch.randn(n, length, d, device="cuda")
-    lam = -torch.rand(n, length, d, device="cuda") * MAX_DECAY  # inside the cap, so both writers apply
+    lam = -torch.rand(n, length, d, device="cuda") * MAX_DECAY  # 在上限以内,所以各种写法都适用
     state = torch.randn(n, d, d, device="cuda") * 0.1
     probe = torch.randn(n, d, d, device="cuda")
     writers = {"scaled (block 256)": lambda *t: delta_write(*t, 256),
@@ -46,7 +45,7 @@ def main():
                "auto (small decays)": lambda *t: delta_write_auto(*t)}
     results = {}
     for name, fn in writers.items():
-        run(fn, state[:, :, :], u[:, :64], z[:, :64], lam[:, :64], probe)  # warm-up
+        run(fn, state[:, :, :], u[:, :64], z[:, :64], lam[:, :64], probe)  # 预热
         times = []
         for _ in range(a.repeat):
             out, grads, sec, peak = run(fn, state, u, z, lam, probe)
@@ -60,7 +59,7 @@ def main():
         print(f"{name} vs scaled: state rel diff {rel(o2, o1):.2e}; grad rel diff state/u/z/lam: "
               + " ".join(f"{rel(x, y):.2e}" for x, y in zip(g2, g1)))
     big = lam.clone()
-    big[:, 300:340, 5] = -2.0  # one channel forgets fast in one 256-token block: that block takes the stable path
+    big[:, 300:340, 5] = -2.0  # 一个通道在某个 256-token 的块里遗忘得很快:这个块会走稳定公式
     for name, fn in (("auto (one large-decay block)", lambda *t: delta_write_auto(*t)),
                      ("stable, same input", lambda *t: delta_write_stable(*t))):
         run(fn, state, u[:, :64], z[:, :64], big[:, :64], probe)

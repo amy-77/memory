@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Environment for train_aligned.sh on a platform image that already has a CUDA build of PyTorch
-# (tested layout: Python 3.12, torch 2.12.1+cu129). Creates a venv that reuses the image's torch and
-# installs only the extra packages, so the image's own transformers / vLLM stay untouched.
+# 给 train_aligned.sh 准备环境,用在已经带 CUDA 版 PyTorch 的平台镜像上
+#(目标镜像:Python 3.12、torch 2.12.1+cu129;已在系统 torch 为 2.11.0+cu130 的机器上实测)。
+# 创建一个复用镜像自带 torch 的 venv,只安装额外的几个包,镜像自带的 transformers / vLLM 不受影响。
 #
-#   bash setup_env.sh                      # venv at ./venv_memt next to this repository copy
+#   bash setup_env.sh                      # venv 建在 train_run 的上一级目录:venv_memt
 #   VENV=/path/venv PIP_INDEX_URL=https://... bash setup_env.sh
 #   source "$VENV/bin/activate"; export PYTHON=python
 set -euo pipefail
@@ -20,7 +20,7 @@ if (major, minor) < (2, 11) or (major, minor) >= (2, 15):
 PY
 "$BASE_PYTHON" -m venv --system-site-packages "$VENV"
 "$VENV/bin/python" -m pip install --upgrade pip
-# torch is deliberately absent: it comes from the image through --system-site-packages
+# 这里故意不装 torch:它通过 --system-site-packages 来自镜像
 "$VENV/bin/python" -m pip install "transformers==5.20.2" "datasets==5.1.0" "einops==0.8.2" "pytest>=8,<10"
 "$VENV/bin/python" - <<'PY'
 import datasets, einops, torch, transformers

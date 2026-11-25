@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Qwen3-4B MemT-style CPT with the memory aligned to MemT-1.0 (no decay cap, chunked WY write, MemT norms and
-# BF16 rounding). Same recipe as train_8gpu.sh otherwise. One node (8 GPUs) or several nodes (e.g. 2 x 8 = 16).
+# Qwen3-4B 的 MemT 式第一阶段训练(CPT),记忆与 MemT-1.0 对齐:没有衰减上限、分块 WY 写入、
+# MemT 的归一化和 BF16 舍入。其余配方与 train_8gpu.sh 相同。单机 8 卡,或多机(例如 2 x 8 = 16 卡)。
 #
 #   RUN_DIR=/shared/run DATA_SPEC='/data/ldc/train/data-*.arrow' MODEL_PATH=/models/Qwen3-4B bash train_aligned.sh
-#   # 16 GPUs: run on both nodes with NNODES=2 NODE_RANK=0|1 MASTER_ADDR=<node 0 address> (RUN_DIR on shared storage)
+#   # 16 卡:两台机器都运行,设 NNODES=2 NODE_RANK=0|1 MASTER_ADDR=<节点 0 的地址>(RUN_DIR 放在共享存储上)
 #
-# Environment:
-#   RUN_DIR, DATA_SPEC (required); MODEL_PATH (Qwen/Qwen3-4B); PYTHON (python)
-#   NNODES (1), NODE_RANK (0), NPROC_PER_NODE (8), MASTER_ADDR (node 0; required when NNODES > 1), MASTER_PORT (29577)
-#   GLOBAL_BATCH (32 sequences of 32K per update; grad accumulation = GLOBAL_BATCH / (NNODES * NPROC_PER_NODE))
-#   STEPS (4768), SAVE_EVERY (240), MEMT_ALIGNED (1; 0 = the unaligned train_8gpu.sh memory, for A/B runs)
-#   RESUME / INIT_MEMORY as in train_8gpu.sh. Extra arguments go to train_memory.py (e.g. --stop-at 10).
+# 环境变量(括号里是默认值):
+#   RUN_DIR、DATA_SPEC(必填);MODEL_PATH(Qwen/Qwen3-4B);PYTHON(python)
+#   NNODES(1)、NODE_RANK(0)、NPROC_PER_NODE(8)、MASTER_ADDR(节点 0 的地址,NNODES > 1 时必填)、MASTER_PORT(29577)
+#   GLOBAL_BATCH(每步 32 条 32K 序列;梯度累积步数 = GLOBAL_BATCH / (NNODES * NPROC_PER_NODE))
+#   STEPS(4768)、SAVE_EVERY(240)、MEMT_ALIGNED(1;设为 0 则用 train_8gpu.sh 的未对齐记忆,做 A/B 对比用)
+#   RESUME / INIT_MEMORY 的用法同 train_8gpu.sh。多余的参数会传给 train_memory.py(例如 --stop-at 10)。
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 FRAMEWORK="$(cd -- "$SCRIPT_DIR/../framework" && pwd)"

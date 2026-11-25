@@ -1,12 +1,11 @@
-"""Environment check for the MemT-style 4B training (and for planning a Megatron port).
+"""MemT 式 4B 训练的环境检查(也用于规划 Megatron 版)。
 
-    python scripts/check_env.py                 # everything, about a minute
-    python scripts/check_env.py --no-network    # skip the package-index queries
-    python scripts/check_env.py --allow-cpu     # CPU-only job: image, packages and index only
+    python scripts/check_env.py                 # 全部检查,约一分钟
+    python scripts/check_env.py --no-network    # 跳过包索引的查询
+    python scripts/check_env.py --allow-cpu     # 纯 CPU 任务:只检查镜像、依赖包和包索引
 
-Prints one line per check and a JSON summary at the end; send the whole output back when something fails.
-Nothing is installed or changed. Compile caches go to TORCHINDUCTOR_CACHE_DIR / TMPDIR if set.
-"""
+每项检查打印一行,最后打印一段 JSON 汇总;有检查失败时,请把完整输出发回来。
+不安装、不修改任何东西。设置了 TORCHINDUCTOR_CACHE_DIR / TMPDIR 时,编译缓存写到那里。"""
 import argparse
 import importlib
 import json
@@ -30,7 +29,7 @@ def version_of(module):
     try:
         mod = importlib.import_module(module)
         return getattr(mod, "__version__", "installed")
-    except Exception as error:  # noqa: BLE001 - report any import failure
+    except Exception as error:  # noqa: BLE001 - 任何导入失败都要报告
         return f"missing ({type(error).__name__})"
 
 
@@ -82,7 +81,7 @@ def main():
 
     if cuda:
         device = torch.device("cuda")
-        try:  # BF16 autocast + FP32 triangular solve: what the memory write uses
+        try:  # BF16 autocast + FP32 三角求解:记忆写入用到的运算
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 y = torch.randn(64, 64, device=device) @ torch.randn(64, 64, device=device)
             lower = torch.randn(8, 64, 64, device=device).tril(-1)
@@ -90,7 +89,7 @@ def main():
             record("bf16 autocast + triangular solve", y.dtype == torch.bfloat16, str(y.dtype))
         except Exception as error:  # noqa: BLE001
             record("bf16 autocast + triangular solve", False, error)
-        try:  # flex_attention with a block mask compiles kernels the first time: needs a working compiler stack
+        try:  # 带块 mask 的 flex_attention 第一次调用要编译 kernel:需要可用的编译环境
             from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
             def same_segment(batch, head, q_idx, kv_idx):
@@ -118,7 +117,7 @@ def main():
         except Exception as error:  # noqa: BLE001
             record("matrix write on GPU vs token loop", False, f"{type(error).__name__}: {error}")
 
-    # Megatron stack: informational, not needed for train_aligned.sh
+    # Megatron 相关:仅供参考,train_aligned.sh 不需要
     for name in ("megatron.core", "megatron.bridge", "transformer_engine", "flash_attn", "apex", "triton", "fla"):
         found = version_of(name)
         REPORT[f"optional {name}"] = {"ok": True, "detail": found}
