@@ -385,7 +385,8 @@ def summarize(args):
         d = np.array([recs[i][arm]["loss"] - recs[i][base]["loss"] for i in ids])
         boot = rng.choice(d, size=(10000, len(d))).mean(1)
         return {"n": len(d), "mean_diff": float(d.mean()), "ci95": [float(np.percentile(boot, 2.5)),
-                float(np.percentile(boot, 97.5))], "frac_lower_loss": float((d < 0).mean())}
+                float(np.percentile(boot, 97.5))], "median_diff": float(np.median(d)),
+                "frac_lower_loss": float((d < 0).mean())}
 
     out = {"arms": {}, "vs_write_all": {}, "turn_subset": {}, "by_type": {}}
     for arm in ARMS:
@@ -396,6 +397,16 @@ def summarize(args):
     for arm in ARMS:
         if arm != "write_all" and arm not in TURN_ARMS and full:
             out["vs_write_all"][arm] = paired(arm, "write_all", full)
+    # 第一批（write_all 加四个按轮次写入的组）先跑完，不必等第二批就能比较
+    p1 = ["write_all", *sorted(TURN_ARMS)]
+    pids = [i for i in recs if all(a in recs[i] for a in p1)]
+    if pids:
+        out["pass1"] = {a: {"n": len(pids), "mean_loss": float(np.mean([recs[i][a]["loss"] for i in pids])),
+                            "median_loss": float(np.median([recs[i][a]["loss"] for i in pids]))} for a in p1}
+        out["pass1_pairs"] = {f"{a}-{b}": paired(a, b, pids) for a, b in [
+            ("turn_oracle", "turn_random"), ("turn_oracle_nodecay", "turn_random_nodecay"),
+            ("turn_oracle_nodecay", "turn_oracle"), ("turn_random_nodecay", "turn_random"),
+            ("turn_oracle", "write_all"), ("turn_random", "write_all"), ("turn_oracle_nodecay", "write_all")]}
     tids = [i for i in recs if all(a in recs[i] for a in ARMS)]
     if tids:
         for arm in ARMS:
